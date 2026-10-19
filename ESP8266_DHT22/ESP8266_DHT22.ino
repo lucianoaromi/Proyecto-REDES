@@ -16,9 +16,15 @@
 #include <DHT.h>
 #include <Ticker.h>
 #include <time.h>
+#include <coredecls.h>
 #include <FS.h>
 #include <math.h>
 #include "secrets.h"
+#include "tls_certificates.h"
+#include "weather_json.h"
+
+// Diagnostico temporal: cambiar a 0 para compilar sin trazas de conexion.
+#define DIAGNOSTICO_CONEXIONES 1
 
 // =============================
 // Brillo del LED de lluvia (0 = apagado, 1023 = máximo)
@@ -120,6 +126,10 @@ const uint8_t LED_API  = D6;  // LED temp API
 const uint8_t LED_RAIN = D7;  // LED lluvia API
 
 float tempApi   = NAN;   // última temperatura desde la API
+float humApi    = NAN;
+time_t weatherLastSuccessTime = 0;
+unsigned long weatherLastSuccessMillis = 0;
+bool weatherLastAttemptOk = false;
 bool  lluviaApi = false; // lluvia AHORA (estado actual)
 bool  lluviaPronosticoApi = false; // lluvia PRONOSTICADA (próximas horas)
 bool  rainWindowActive = false;     // indica si estamos dentro de la ráfaga de parpadeo
@@ -152,6 +162,41 @@ unsigned long lastAlert = 0;                 // tiempo del último aviso
 const unsigned long ALERT_INTERVAL = 300000; // 5 MINUTOS
 
 WiFiServer server(80);
+
+// TLS se ejecuta de a una conexion y solo cuando no hay un cliente HTTP pendiente.
+const unsigned long WIFI_START_TIMEOUT_MS = 15000UL;
+const unsigned long EXTERNAL_RETRY_MS = 30000UL;
+const uint16_t EXTERNAL_IO_TIMEOUT_MS = 5000;
+const time_t MIN_TLS_TIME = 1704067200; // 01/01/2024 UTC: control de plausibilidad
+bool horaSincronizada = false;
+bool avisoInicioPendiente = true;
+bool climaInicialPendiente = true;
+String alertaPendiente;
+bool intentoTelegramRealizado = false;
+bool intentoWeatherRealizado = false;
+unsigned long ultimoIntentoTelegram = 0;
+unsigned long ultimoIntentoWeather = 0;
+unsigned long ultimoIntentoWifi = 0;
+
+bool horaValidaParaTLS() {
+  return horaSincronizada && time(nullptr) >= MIN_TLS_TIME;
+}
+
+bool puedeIniciarTLS() {
+  if (WiFi.status() != WL_CONNECTED || !horaValidaParaTLS()) return false;
+  // RX de 16 KiB evita depender de MFLN. Reservar margen para TLS y las estructuras JSON.
+  return ESP.getFreeHeap() >= 35000 && ESP.getMaxFreeBlockSize() >= 17000;
+}
+
+void configurarTLS(WiFiClientSecure &client, const BearSSL::X509List &ca) {
+  client.setTrustAnchors(&ca);
+  client.setSSLVersion(BR_TLS12, BR_TLS12);
+  client.setX509Time(time(nullptr));
+  client.setTimeout(EXTERNAL_IO_TIMEOUT_MS);
+  client.setBufferSizes(16384, 512);
+}
+
+#include "connection_diagnostics.h"
 
 // =============================
 // LOG EN SPIFFS (HASTA ~1 MES)
@@ -209,21 +254,33 @@ String urlEncode(const String &text) {
 // =============================
 // ENVIAR MENSAJE TELEGRAM
 // =============================
-void enviarTelegram(const String &mensaje) {
+bool enviarTelegram(const String &mensaje) {
+  DIAG_MEMORIA(ServicioDiag::Telegram);
+  if (!puedeIniciarTLS()) {
+    DIAG_APLAZAMIENTO_TLS(ServicioDiag::Telegram);
+    return false;
+  }
+  DIAG_ESTADO(ServicioDiag::Telegram, EstadoDiag::Habilitada,
+              F("HABILITADA"), F("WiFi, hora y memoria aptos"));
+  // La CA debe vivir tanto como el cliente que la utiliza.
+  BearSSL::X509List ca(TELEGRAM_ROOT_CA);
   WiFiClientSecure client;
-
-  client.setInsecure();
-  client.setTimeout(5000);
-  client.setBufferSizes(256, 384);  // más chico para ahorrar RAM
+  configurarTLS(client, ca);
 
   Serial.println("📡 Conectando a Telegram...");
 
+  unsigned long inicioConexion = millis();
+  DIAG_MARCAR_INTENTO_TG();
+  DIAG_ESTADO(ServicioDiag::Telegram, EstadoDiag::Intento,
+              F("INTENTO"), F("DNS/TCP/TLS iniciado"));
   if (!client.connect("api.telegram.org", 443)) {
-    Serial.println("❌ Error conectando a Telegram");
-    return;
+    DIAG_ESTADO(ServicioDiag::Telegram, EstadoDiag::ErrorConexion,
+                F("ERROR_CONEXION"), F("DNS/TCP/TLS fallido"));
+    Serial.printf("[Telegram] Conexion TLS rechazada/fallida (codigo %d).\n",
+                  client.getLastSSLError());
+    return false;
   }
-
-  delay(150); // Telegram lo necesita
+  DIAG_TLS_CONECTADA(ServicioDiag::Telegram, inicioConexion);
 
   String url = "/bot" + TELEGRAM_TOKEN +
                "/sendMessage?chat_id=" + CHAT_ID +
@@ -238,14 +295,32 @@ void enviarTelegram(const String &mensaje) {
 
   Serial.println("📨 Enviando mensaje a Telegram...");
 
-  String line = client.readStringUntil('\n');
-  if (line.startsWith("HTTP/1.1 200")) {
-    Serial.println("✅ Telegram enviado correctamente");
+  // Limitar longitud y tiempo total; no registrar respuestas remotas con posibles secretos.
+  String line;
+  unsigned long inicioRespuesta = millis();
+  while (millis() - inicioRespuesta < EXTERNAL_IO_TIMEOUT_MS && line.length() < 96) {
+    if (client.available()) {
+      char c = client.read();
+      if (c == '\n') break;
+      line += c;
+    } else if (!client.connected()) {
+      break;
+    }
+    delay(1);
+  }
+  bool enviado = line.startsWith("HTTP/1.1 200");
+  if (enviado) {
+    DIAG_ESTADO(ServicioDiag::Telegram, EstadoDiag::Exito,
+                F("EXITO"), F("respuesta HTTP 200"));
+    Serial.println("[Telegram] Respuesta HTTP 200 recibida.");
   } else {
-    Serial.println("⚠ Respuesta inesperada: " + line);
+    DIAG_ESTADO(ServicioDiag::Telegram, EstadoDiag::ErrorRespuesta,
+                F("ERROR_RESPUESTA"), F("sin confirmacion HTTP 200"));
+    Serial.println("[Telegram] Sin confirmacion HTTP 200; se reintentara.");
   }
 
   client.stop();
+  return enviado;
 }
 
 // =============================
@@ -620,236 +695,109 @@ void actualizarLedRain(unsigned long /*ahora*/) {
 // =============================
 // WeatherAPI → temperatura + lluvia → LEDs
 // =============================
-void actualizarClimaApi() {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("[API] WiFi no conectado, no se consulta WeatherAPI.");
-    return;
-  }
+struct WeatherJsonClock {
+  static uint32_t now() { return millis(); }
+  static void idle() { delay(1); }
+};
 
-  WiFiClient client;
+bool actualizarClimaApi() {
+  weatherLastAttemptOk = false;
+  DIAG_MEMORIA(ServicioDiag::WeatherAPI);
+  if (!puedeIniciarTLS()) {
+    DIAG_APLAZAMIENTO_TLS(ServicioDiag::WeatherAPI);
+    return false;
+  }
+  DIAG_ESTADO(ServicioDiag::WeatherAPI, EstadoDiag::Habilitada,
+              F("HABILITADA"), F("WiFi, hora y memoria aptos"));
+
+  BearSSL::X509List ca(WEATHER_ROOT_CA);
+  WiFiClientSecure client;
+  configurarTLS(client, ca);
   HTTPClient http;
 
-  String url = "http://api.weatherapi.com/v1/forecast.json?key=";
+  String url = "https://api.weatherapi.com/v1/forecast.json?key=";
   url += WEATHER_API_KEY;
   url += "&q=";
   url += WEATHER_CITY;
   url += "&lang=es&aqi=no&days=1";  // 1 día de pronóstico
 
   Serial.println("[API] Consultando WeatherAPI (forecast + current)...");
-  Serial.print("[API] URL: ");
-  Serial.println(url);
 
   // IMPORTANTE: evitar chunked y problemas raros
   http.useHTTP10(true);
-  http.setTimeout(10000);  // 10 s
+  http.setTimeout(EXTERNAL_IO_TIMEOUT_MS);
+  http.setReuse(false);
+  http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
 
   if (!http.begin(client, url)) {
+    DIAG_ESTADO(ServicioDiag::WeatherAPI, EstadoDiag::ErrorRespuesta,
+                F("ERROR_PREPARACION"), F("http.begin fallido; sin conexion"));
     Serial.println("[API] Error en http.begin()");
-    return;
+    return false;
   }
 
+  unsigned long inicioConexion = millis();
+  DIAG_MARCAR_INTENTO_WEATHER();
+  DIAG_ESTADO(ServicioDiag::WeatherAPI, EstadoDiag::Intento,
+              F("INTENTO"), F("HTTP GET HTTPS iniciado; DNS/TCP/TLS"));
   int httpCode = http.GET();
+  DIAG_CABECERAS_WEATHER(httpCode, inicioConexion);
   Serial.printf("[API] httpCode = %d\n", httpCode);
 
   if (httpCode != HTTP_CODE_OK) {
+    DIAG_ESTADO(ServicioDiag::WeatherAPI,
+                httpCode < 0 ? EstadoDiag::ErrorConexion : EstadoDiag::ErrorRespuesta,
+                httpCode < 0 ? F("ERROR_CONEXION") : F("ERROR_RESPUESTA"),
+                F("HTTP GET sin codigo 200"));
     Serial.printf("[API] Error HTTP: %d\n", httpCode);
     http.end();
-    return;
+    return false;
   }
 
-  // En vez de getString() de TODO, leemos solo una parte (p.ej. 4 KB)
   WiFiClient *stream = http.getStreamPtr();
-  String payload = "";
-  const size_t MAX_LEN = 8192;   // margen mayor para incluir pronóstico completo
-  unsigned long t0 = millis();
-
-  while (stream->connected() && (millis() - t0 < 3000) && payload.length() < MAX_LEN) {
-    while (stream->available() && payload.length() < MAX_LEN) {
-      char c = stream->read();
-      payload += c;
-    }
+  if (!stream) {
+    DIAG_ESTADO(ServicioDiag::WeatherAPI, EstadoDiag::ErrorRespuesta,
+                F("ERROR_RESPUESTA"), F("flujo HTTP no disponible"));
+    http.end();
+    return false;
   }
 
+  WeatherReadings readings;
+  size_t bytesRead = 0;
+  WeatherJsonStatus status = readWeatherResponse<WiFiClient, WeatherJsonClock>(
+      *stream, http.getSize(), 3000, readings, bytesRead);
   http.end();
-
-  Serial.printf("[API] payload length = %u\n", payload.length());
-  Serial.println("[API] ---- PAYLOAD PARCIAL ----");
-  Serial.println(payload);
-  Serial.println("[API] --------------------------");
-
-  if (payload.length() == 0) {
-    Serial.println("[API] Payload vacío, no se puede parsear.");
-    return;
+  Serial.printf("[API] bytes procesados = %u\n", static_cast<unsigned>(bytesRead));
+  if (status != WeatherJsonStatus::Ok) {
+    DIAG_ESTADO(ServicioDiag::WeatherAPI, EstadoDiag::ErrorRespuesta,
+                F("ERROR_RESPUESTA"), F("JSON incompleto o invalido"));
+    Serial.printf("[API] Respuesta descartada (estado JSON %u); se conserva el clima anterior.\n",
+                  static_cast<unsigned>(status));
+    return false;
   }
 
-  // --------- TEMP_C (current) ----------
-  int idx = payload.indexOf("\"temp_c\":");
-  if (idx < 0) {
-    Serial.println("[API] No se encontró 'temp_c' en la respuesta.");
-    return;
-  }
-  idx += 9; // salta "temp_c":
+  // Publicar el conjunto solo cuando el cuerpo completo y los cinco campos son validos.
+  const float UMBRAL_PRECIP_ACTUAL = 0.85f;
+  const int   UMBRAL_CHANCE_PRONOSTICO = 75;
+  const float UMBRAL_PRECIP_PRONOSTICO = 0.4f;
+  tempApi = readings.temperature;
+  humApi = readings.humidity;
+  weatherLastSuccessTime = time(nullptr);
+  weatherLastSuccessMillis = millis();
+  weatherLastAttemptOk = true;
+  lluviaApi = readings.currentPrecip > UMBRAL_PRECIP_ACTUAL;
+  lluviaPronosticoApi = readings.willRain == 1 &&
+      (readings.rainChance >= UMBRAL_CHANCE_PRONOSTICO ||
+       readings.dailyPrecip >= UMBRAL_PRECIP_PRONOSTICO);
 
-  int end = payload.indexOf(',', idx);
-  if (end < 0) {
-    Serial.println("[API] No se pudo aislar el valor de temp_c.");
-    return;
-  }
-
-  String tempStr = payload.substring(idx, end);
-  tempStr.trim();
-  float tExt = tempStr.toFloat();
-
-  if (tExt == 0 && tempStr.indexOf('0') == -1) {
-    Serial.println("[API] Conversión de temp_c a float dudosa.");
-    return;
-  }
-
-  tempApi = tExt;
   Serial.printf("[API] Temp API = %.1f C\n", tempApi);
-
-//-------------------------------------------------------------------------------------------------
-
-  // --------- LLUVIA / TORMENTA (ahora) ----------
-  // Estricto: solo precip_mm > umbral y (opcional) códigos de condición
-  bool hayLluvia = false;
-
-  // precip_mm actual
-  int idxP = payload.indexOf("\"precip_mm\":");
-  float precip = 0.0f;
-  if (idxP >= 0) {
-    idxP += 12; // salta "precip_mm":
-    int endP = payload.indexOf(',', idxP);
-    if (endP < 0) endP = payload.indexOf('}', idxP);
-    if (endP > idxP) {
-      String pStr = payload.substring(idxP, endP);
-      pStr.trim();
-      precip = pStr.toFloat();
-      Serial.printf("[API] Precip_mm (actual) = %.2f\n", precip);
-    }
-  }
-
-/*
-  // code actual (por si se quiere filtrar por rango de lluvia)
-  int code = -1;
-  int idxCode = payload.indexOf("\"code\":");
-  if (idxCode >= 0) {
-    idxCode += 7; // salta "code":
-    int endCode = payload.indexOf(',', idxCode);
-    if (endCode < 0) endCode = payload.indexOf('}', idxCode);
-    if (endCode > idxCode) {
-      String cStr = payload.substring(idxCode, endCode);
-      cStr.trim();
-      code = cStr.toInt();
-      Serial.printf("[API] code (actual) = %d\n", code);
-    }
-  }
-*/
-
-  // Umbral de precipitación más estricto
-  const float UMBRAL_PRECIP_ACTUAL = 0.85f; // mm
-  // Rango de códigos de lluvia según WeatherAPI: 1063-1207 aprox.
-  //bool codeEsLluvia = (code >= 1063 && code <= 1207);
-
-  if (precip > UMBRAL_PRECIP_ACTUAL) { //precip > UMBRAL_PRECIP_ACTUAL && codeEsLluvia
-    hayLluvia = true;
-  }
-
-  lluviaApi = hayLluvia;
-  Serial.printf("[API] lluvia actual = %s\n", lluviaApi ? "SI" : "NO");
-
-
-//-------------------------------------------------------------------------------------------------
-
-  // --------- PRONÓSTICO DE LLUVIA (día completo) ----------
-  bool hayLluviaPronostico = false;
-
-  // daily_will_it_rain (0/1) y daily_chance_of_rain (%)
-  int idxWill = payload.indexOf("\"daily_will_it_rain\":");
-  int willRain = 0;
-  if (idxWill >= 0) {
-    int colon = payload.indexOf(':', idxWill);
-    int endWill = payload.indexOf(',', colon + 1);
-    if (endWill < 0) endWill = payload.indexOf('}', colon + 1);
-    if (colon > 0 && endWill > colon) {
-      String wStr = payload.substring(colon + 1, endWill);
-      wStr.trim();
-      willRain = wStr.toInt();
-      Serial.printf("[API] daily_will_it_rain = %d\n", willRain);
-    }
-  }
-
-  int idxChance = payload.indexOf("\"daily_chance_of_rain\":");
-  Serial.printf("[API] idxChance = %d\n", idxChance);
-
-  int chance = 0;
-  if (idxChance >= 0) {
-    int colon = payload.indexOf(':', idxChance);
-    Serial.printf("[API] colon = %d\n", colon);
-
-    if (colon > 0) {
-      int start = colon + 1;  // primer carácter después de ':'
-      int endChance = payload.indexOf(',', start);
-      if (endChance < 0) endChance = payload.indexOf('}', start);
-
-      Serial.printf("[API] start = %d, endChance = %d\n", start, endChance);
-
-      if (endChance > start) {
-        String cStr = payload.substring(start, endChance);
-        cStr.trim();
-        Serial.print("[API] cStr (raw) = '");
-        Serial.print(cStr);
-        Serial.println("'");
-
-        chance = cStr.toInt();
-        Serial.printf("[API] daily_chance_of_rain = %d%%\n", chance);
-      } else {
-        Serial.println("[API] endChance <= start, no se pudo aislar daily_chance_of_rain.");
-      }
-    } else {
-      Serial.println("[API] No se encontró ':' después de daily_chance_of_rain.");
-    }
-  } else {
-    Serial.println("[API] 'daily_chance_of_rain' no encontrado en payload.");
-  }
-
-  // totalprecip_mm del día completo (pronóstico)
-  float precipDia = 0.0f;
-  int idxTotal = payload.indexOf("\"totalprecip_mm\":", idxChance >= 0 ? idxChance : idxWill);
-  if (idxTotal < 0) idxTotal = payload.indexOf("\"totalprecip_mm\":"); // respaldo
-  if (idxTotal >= 0) {
-    idxTotal += 17; // salta "totalprecip_mm":
-    int endTotal = payload.indexOf(',', idxTotal);
-    if (endTotal < 0) endTotal = payload.indexOf('}', idxTotal);
-    if (endTotal > idxTotal) {
-      String tpStr = payload.substring(idxTotal, endTotal);
-      tpStr.trim();
-      precipDia = tpStr.toFloat();
-      Serial.printf("[API] totalprecip_mm (día) = %.2f\n", precipDia);
-    }
-  }
-
-  // Criterio más estricto: requiere will_it_rain == 1 y además
-  // (chance >= umbral) O (totalprecip_mm >= umbral de lluvia pronosticada)
-  const int   UMBRAL_CHANCE_PRONOSTICO  = 75;   // % mínimo
-  const float UMBRAL_PRECIP_PRONOSTICO  = 0.4f; // mm mínimo en el día
-
-  bool chanceAlto      = (chance >= UMBRAL_CHANCE_PRONOSTICO);
-  bool precipDiaAlto   = (precipDia >= UMBRAL_PRECIP_PRONOSTICO);
-
-  if (willRain == 1 && (chanceAlto || precipDiaAlto)) {
-    hayLluviaPronostico = true;
-  } else {
-    hayLluviaPronostico = false;
-  }
-
-  lluviaPronosticoApi = hayLluviaPronostico;
-  Serial.printf("[API] lluvia pronosticada = %s\n", lluviaPronosticoApi ? "SI" : "NO");
-
-  // Ajustar patrón de LED según el nuevo estado
+  Serial.printf("[API] Precip_mm (actual) = %.2f\n", readings.currentPrecip);
+  Serial.printf("[API] daily_will_it_rain = %d\n", readings.willRain);
+  Serial.printf("[API] daily_chance_of_rain = %d%%\n", readings.rainChance);
+  Serial.printf("[API] totalprecip_mm (dia) = %.2f\n", readings.dailyPrecip);
+  Serial.printf("[API] lluvia actual = %s | lluvia pronosticada = %s\n",
+                lluviaApi ? "SI" : "NO", lluviaPronosticoApi ? "SI" : "NO");
   actualizarPatronLluvia();
-
-//-------------------------------------------------------------------------------------------------
 
   // --------- LED DE TEMPERATURA ----------
   const float UMBRAL_LED = 35.0;  // umbral temp API
@@ -861,9 +809,111 @@ void actualizarClimaApi() {
     digitalWrite(LED_API, LOW);
     Serial.println("[API] LED_API OFF (temp_api < umbral o dato inválido)");
   }
+  DIAG_ESTADO(ServicioDiag::WeatherAPI, EstadoDiag::Exito,
+              F("EXITO"), F("HTTP 200 y JSON valido"));
+  return true;
 }
 
 // ============================= Fin de actualizarClimaApi() ======================================
+
+// Sin espera de NTP en loop(): el callback del core habilita TLS cuando llega la hora.
+// Cada llamada ejecuta como maximo una operacion externa, sin conexiones TLS simultaneas.
+void atenderServiciosExternos() {
+  unsigned long ahora = millis();
+  bool telegramPendiente = avisoInicioPendiente || alertaPendiente.length() > 0;
+  bool weatherPendiente = climaInicialPendiente || ahora - lastWeatherCheck >= WEATHER_INTERVAL;
+  DIAG_WEATHER_PERIODICO(ahora);
+  if (WiFi.status() != WL_CONNECTED) {
+    if (telegramPendiente) {
+      DIAG_ESTADO(ServicioDiag::Telegram, EstadoDiag::Wifi,
+                  F("APLAZADA"), F("WiFi desconectado"));
+    }
+    if (weatherPendiente) {
+      DIAG_ESTADO(ServicioDiag::WeatherAPI, EstadoDiag::Wifi,
+                  F("APLAZADA"), F("WiFi desconectado"));
+    }
+    if (ahora - ultimoIntentoWifi >= EXTERNAL_RETRY_MS) {
+      ultimoIntentoWifi = ahora;
+      DIAG_RECONEXION_WIFI();
+      WiFi.reconnect();
+    }
+    return;
+  }
+  if (!horaValidaParaTLS()) {
+    if (telegramPendiente) {
+      DIAG_ESTADO(ServicioDiag::Telegram, EstadoDiag::Ntp,
+                  F("APLAZADA"), F("hora NTP no valida"));
+    }
+    if (weatherPendiente) {
+      DIAG_ESTADO(ServicioDiag::WeatherAPI, EstadoDiag::Ntp,
+                  F("APLAZADA"), F("hora NTP no valida"));
+    }
+    return;
+  }
+
+  if (telegramPendiente && intentoTelegramRealizado &&
+      ahora - ultimoIntentoTelegram < EXTERNAL_RETRY_MS) {
+    DIAG_ESTADO(ServicioDiag::Telegram, EstadoDiag::Reintento,
+                F("APLAZADA"), F("esperando intervalo de reintento 30000 ms"));
+  }
+
+  if (telegramPendiente &&
+      (!intentoTelegramRealizado || ahora - ultimoIntentoTelegram >= EXTERNAL_RETRY_MS)) {
+    if (weatherPendiente && !rainWindowActive &&
+        (!intentoWeatherRealizado || ahora - ultimoIntentoWeather >= EXTERNAL_RETRY_MS)) {
+      DIAG_ESTADO(ServicioDiag::WeatherAPI, EstadoDiag::Prioridad,
+                  F("APLAZADA"), F("turno de Telegram"));
+    }
+    intentoTelegramRealizado = true;
+    ultimoIntentoTelegram = ahora;
+    DIAG_REINICIAR_INTENTO_TG();
+    unsigned long inicioOperacion = millis();
+    bool enviado = false;
+    if (avisoInicioPendiente) {
+      enviado = enviarTelegram("🤖 Sistema iniciado correctamente.\nIP: " + WiFi.localIP().toString());
+      if (enviado) {
+        avisoInicioPendiente = false;
+      }
+    } else {
+      enviado = enviarTelegram(alertaPendiente);
+      if (enviado) alertaPendiente = "";
+    }
+    DIAG_FIN(ServicioDiag::Telegram, inicioOperacion, enviado, DIAG_HUBO_INTENTO_TG());
+    if (!enviado) {
+      DIAG_ESTADO(ServicioDiag::Telegram, EstadoDiag::Pendiente,
+                  F("PENDIENTE"), F("reintento de Telegram"));
+    }
+    return;
+  }
+
+  if (weatherPendiente && rainWindowActive) {
+    DIAG_ESTADO(ServicioDiag::WeatherAPI, EstadoDiag::Lluvia,
+                F("APLAZADA"), F("ventana del LED de lluvia activa"));
+  } else if (weatherPendiente && intentoWeatherRealizado &&
+             ahora - ultimoIntentoWeather < EXTERNAL_RETRY_MS) {
+    DIAG_ESTADO(ServicioDiag::WeatherAPI, EstadoDiag::Reintento,
+                F("APLAZADA"), F("esperando intervalo de reintento 30000 ms"));
+  }
+  if (!rainWindowActive &&
+      (climaInicialPendiente || ahora - lastWeatherCheck >= WEATHER_INTERVAL) &&
+      (!intentoWeatherRealizado || ahora - ultimoIntentoWeather >= EXTERNAL_RETRY_MS)) {
+    intentoWeatherRealizado = true;
+    ultimoIntentoWeather = ahora;
+    lastWeatherCheck = ahora;
+    DIAG_REARMAR_WEATHER();
+    DIAG_REINICIAR_INTENTO_WEATHER();
+    unsigned long inicioOperacion = millis();
+    bool actualizado = actualizarClimaApi();
+    if (actualizado) climaInicialPendiente = false;
+    DIAG_FIN(ServicioDiag::WeatherAPI, inicioOperacion, actualizado,
+             DIAG_HUBO_INTENTO_WEATHER());
+    if (!actualizado) {
+      DIAG_ESTADO(ServicioDiag::WeatherAPI, EstadoDiag::Pendiente,
+                  F("PENDIENTE"), climaInicialPendiente ?
+                  F("reintento inicial") : F("siguiente consulta periodica"));
+    }
+  }
+}
 
 // =============================
 // CSV nombre e info
@@ -957,21 +1007,39 @@ void setup() {
   pinMode(LED_RAIN, OUTPUT);   // NUEVO
   analogWrite(LED_RAIN, 0); // NUEVO
 
+  DIAG_ESTADO(ServicioDiag::Telegram, EstadoDiag::Pendiente,
+              F("PENDIENTE"), F("aviso de inicio"));
+  DIAG_ESTADO(ServicioDiag::WeatherAPI, EstadoDiag::Pendiente,
+              F("PENDIENTE"), F("primera consulta"));
+  WiFi.setAutoReconnect(true);
+  DIAG_INICIO_WIFI();
   WiFi.begin(ssid, password);
+  ultimoIntentoWifi = millis();
   Serial.print("Conectando a WiFi...");
-  while (WiFi.status() != WL_CONNECTED) {
+  while (WiFi.status() != WL_CONNECTED &&
+         millis() - ultimoIntentoWifi < WIFI_START_TIMEOUT_MS) {
     delay(500);
     Serial.print(".");
   }
-  Serial.println(" conectado!");
-  Serial.print("IP: ");
-  Serial.println(WiFi.localIP());
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println(" conectado!");
+    Serial.print("IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println(" sin conexion; se reintentara sin detener las mediciones.");
+    DIAG_WIFI_INICIO_FALLIDO();
+  }
+  DIAG_OBSERVAR_WIFI();
 
+  settimeofday_cb([](bool desdeSntp) {
+    if (desdeSntp) {
+      horaSincronizada = true;
+      DIAG_MARCAR_NTP();
+    }
+  });
+  DIAG_INICIO_NTP();
   configTime(-3 * 3600, 0, "pool.ntp.org", "time.nist.gov");
-
-  // Primera consulta para inicializar LEDs y estado sin esperar el intervalo completo
-  actualizarClimaApi();
-  lastWeatherCheck = millis();
+  Serial.println("[NTP] TLS pendiente hasta recibir una hora valida; sin espera bloqueante.");
 
   for (int i = 0; i < HOUR_POINTS; i++) {
     histTemp[i] = NAN;
@@ -989,7 +1057,7 @@ void setup() {
 
   server.begin();
 
-  enviarTelegram("🤖 Sistema iniciado correctamente.\nIP: " + WiFi.localIP().toString());
+  // La notificacion de inicio y la primera consulta se atienden desde loop().
 
   // Inicializa el patrón de lluvia (apagado por defecto)
   actualizarPatronLluvia();
@@ -1000,8 +1068,37 @@ void setup() {
 // =============================
 // LOOP PRINCIPAL
 // =============================
+void imprimirClimaExterior(Print &output) {
+  bool valid = weatherLastSuccessTime > 0 && isfinite(tempApi) && isfinite(humApi);
+  bool stale = valid && (!weatherLastAttemptOk ||
+      millis() - weatherLastSuccessMillis > WEATHER_INTERVAL);
+  char updated[20] = {};
+  if (valid) {
+    struct tm *date = localtime(&weatherLastSuccessTime);
+    if (date) strftime(updated, sizeof(updated), "%d/%m/%Y %H:%M:%S", date);
+  }
+  output.print(",\"weather\":{\"valid\":");
+  output.print(valid ? "true" : "false");
+  output.print(",\"temp\":");
+  if (valid) output.print(tempApi, 1); else output.print("null");
+  output.print(",\"hum\":");
+  if (valid) output.print(humApi, 0); else output.print("null");
+  output.print(",\"updated\":");
+  if (updated[0]) {
+    output.print('"');
+    output.print(updated);
+    output.print('"');
+  } else {
+    output.print("null");
+  }
+  output.print(",\"stale\":");
+  output.print(stale ? "true}" : "false}");
+}
+
 void loop() {
   unsigned long ahora = millis();
+  DIAG_OBSERVAR_NTP();
+  DIAG_OBSERVAR_WIFI();
 
 // 1) SIEMPRE: actualizar LED de lluvia primero (rápido, sin bloqueos)
   actualizarLedRain(ahora);
@@ -1028,16 +1125,14 @@ void loop() {
         alerta += "💧 Hum: " + String(hUso, 0) + " %\n";
         alerta += "🕒 " + obtenerFechaHora();
 
-        enviarTelegram(alerta);
+        // Conservar el aviso hasta poder enviarlo con WiFi, hora y TLS validos.
+        if (alertaPendiente.length() == 0) {
+          DIAG_EVENTO(ServicioDiag::Telegram, F("PENDIENTE"),
+                      F("alerta de temperatura"));
+        }
+        alertaPendiente = alerta;
       }
     }
-  }
-
-  // WeatherAPI cada X minutos
-  // Evita bloquear el parpadeo de lluvia con llamadas HTTP largas
-  if (!rainWindowActive && (ahora - lastWeatherCheck >= WEATHER_INTERVAL)) {
-    lastWeatherCheck = ahora;
-    actualizarClimaApi();
   }
 
 //-------------------------------------------------------------------------------------------------
@@ -1045,7 +1140,11 @@ void loop() {
   // SERVIDOR WEB
   // =============================
   WiFiClient client = server.available();
-  if (!client) return;
+  if (!client) {
+    atenderServiciosExternos();
+    return;
+  }
+  DIAG_CLIENTE_HTTP(millis());
 
   unsigned long timeout = millis();
   while (!client.available()) {
@@ -1124,7 +1223,9 @@ void loop() {
       if (i > 0) client.print(",");
       client.print(histHum[idx], 0);
     }
-    client.println("]}");
+    client.print("]");
+    imprimirClimaExterior(client);
+    client.println("}");
 
     client.stop();
     return;
@@ -1218,7 +1319,8 @@ void loop() {
   client.println("Connection: close");
   client.println();
 
-  client.println(R"rawliteral(
+  // El mismo HTML se envia desde flash para dejar RAM disponible para TLS.
+  client.println(F(R"rawliteral(
 
 
 <!-- ============================================================================================= -->
@@ -1236,12 +1338,14 @@ void loop() {
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 
     <style>
+        *, *::before, *::after { box-sizing: border-box; }
         body {
             background: #0d0f1a;
             color: #e0e0e0;
             font-family: Segoe UI, sans-serif;
             text-align: center;
-            padding: 25px;
+            margin: 0;
+            padding: 28px;
         }
 
         h1 {
@@ -1270,7 +1374,7 @@ void loop() {
             gap: 10px;
             padding: 11px 15px;
             width: 100%;
-            max-width: 560px;
+            max-width: 1000px;
         }
 
         .header-info {
@@ -1395,6 +1499,13 @@ void loop() {
             min-width: 280px;
         }
 
+        .chart-canvas {
+            position: relative;
+            width: 100%;
+            aspect-ratio: 2 / 1;
+            min-height: 150px;
+        }
+
         /* ======== Estilo iPhone Lunar Card ======== */
         .lunar-ios {
             background: rgba(255, 255, 255, 0.04);
@@ -1509,95 +1620,118 @@ void loop() {
             font-size: 22px;
         }
 
-        .panel-main {
-            position: relative;
-            display: flex;
-            gap: 11px;
-            align-items: flex-start;
-            padding: 11px 15px;
+        .monitoring-layout {
             width: 100%;
-            max-width: 560px;
-            margin: 11px auto;
+            max-width: 1000px;
+            margin: 0 auto;
         }
 
-        .climate-section {
-            flex: 1;
-            min-width: 260px;
-            padding-right: 6px;
+        .environment-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 18px;
+            margin: 18px 0;
         }
 
-        .lunar-section {
-            flex: 1;
-            min-width: 240px;
-            padding-left: 6px;
+        .environment-card {
+            display: flex;
+            flex-direction: column;
+            min-width: 0;
+            min-height: 300px;
+            margin: 0;
+            padding: 22px;
+            border: 1px solid rgba(255,255,255,0.06);
+            transition: transform 0.25s, box-shadow 0.25s;
         }
 
-        @media (max-width: 600px) {
-            body {
-                padding: 18px 12px;
-            }
+        .card-heading, .card-title-group {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
 
-            .panel {
-                display: block;
-                min-width: 0;
-            }
+        .card-heading { justify-content: space-between; margin-bottom: 25px; }
+        .card-title-group { min-width: 0; }
+        .card-symbol { color: #ff8b5d; font-size: 30px; }
+        .card-heading h2 { margin: 0 0 5px; color: #EEE; font-size: 20px; font-weight: 600; }
+        .card-subtitle { margin: 0; color: #aaa; font-size: 11px; letter-spacing: 0.07em; }
+        .metric-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+        .metric-grid .section-title { color: #bdc2cc; font-size: 14px; font-weight: 500; }
+        .metric-grid .icon { font-size: 22px; }
+        .reading { display: flex; align-items: baseline; gap: 5px; margin-top: 8px; }
+        .reading .value, .reading #temp, .reading #hum { font-size: 38px; font-weight: 600; line-height: 1.2; }
+        .temp-reading { color: #FFD700; }
+        .hum-reading { color: #00B4FF; }
+        .reading-unit { color: #aaa; font-size: 18px; }
+        .card-details { margin-top: auto; padding-top: 20px; }
+        .card-details::before { content: ''; display: block; height: 1px; margin-bottom: 14px; background: rgba(255,255,255,0.08); }
+        .extrema-row { display: flex; justify-content: space-between; gap: 10px; margin-top: 8px; font-size: 13px; color: #aaa; }
+        .extrema-row .value { font-size: 15px; color: #e0e0e0; }
+        .extrema-values { white-space: nowrap; color: #aaa; }
+        .weather-status { flex-shrink: 0; padding: 5px 8px; border-radius: 20px; background: rgba(255,255,255,0.05); color: #aaa; font-size: 10px; }
+        .weather-status[data-state="current"] { background: rgba(76,175,80,0.10); color: #98c69b; }
+        .weather-status[data-state="stale"] { background: rgba(255,193,7,0.10); color: #d4b675; }
+        .weather-location { display: flex; align-items: center; gap: 6px; color: #bdc2cc; font-size: 13px; }
+        .weather-location .material-symbols-rounded { font-size: 17px; color: #ff8b5d; }
+        .weather-updated { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 6px 12px; margin-top: 10px; font-size: 11px; color: #9096a4; }
+        .weather-updated time { color: #bdc2cc; font-size: 12px; }
 
-            .panel.header-panel {
-                flex-direction: column;
-                align-items: center;
-                justify-content: center;
-                min-width: 0;
-                width: clamp(200px, 72vw, 280px);
-                margin: 0 auto 14px auto;
-                padding: 15px 16px 13px 16px;
-                gap: 11px;
-                text-align: center;
-            }
+        .lunar-card {
+            display: grid;
+            grid-template-columns: minmax(0, 1.2fr) repeat(2, minmax(0, 1fr));
+            align-items: center;
+            gap: 24px;
+            width: 100%;
+            min-width: 0;
+            margin: 0 0 22px;
+            padding: 22px;
+            border: 1px solid rgba(255,255,255,0.06);
+        }
 
-            .header-info {
-                justify-content: center;
-            }
+        .lunar-overview { display: flex; align-items: center; gap: 18px; min-width: 0; }
+        .lunar-card .lunar-header { gap: 7px; margin-bottom: 5px; }
+        .lunar-card .lunar-title { font-size: 14px; color: #aaa; font-weight: 500; }
+        .lunar-card .lunar-icon-title { font-size: 20px; }
+        .lunar-card .lunar-phase-name { margin: 0; text-align: left; font-size: 18px; }
+        .lunar-card .moon-emoji { font-size: 52px; }
+        .lunar-event { display: flex; flex-direction: column; gap: 8px; padding-left: 22px; border-left: 1px solid rgba(255,255,255,0.08); }
+        .lunar-event .label-ios { font-size: 12px; }
+        .lunar-event .value-ios { font-size: 17px; font-weight: 600; }
 
-            .header-update {
-                align-items: center;
-            }
+        @media (hover: hover) {
+            .environment-card:hover { transform: translateY(-2px); box-shadow: 0 8px 22px rgba(0,0,0,0.15); }
+        }
 
-            .panel-main {
-                flex-direction: column;
-                align-items: stretch;
-                min-width: 0;
-                width: clamp(240px, 88vw, 340px);
-                margin: 15px auto;
-                padding: 18px;
-                gap: 16px;
-                box-sizing: border-box;
-            }
+        @media (max-width: 680px) {
+            body { padding: 18px 16px; }
+            .panel.header-panel { width: 100%; min-width: 0; padding: 16px; gap: 12px; }
+            .header-info { gap: 9px; }
+            .header-icon { font-size: 32px; }
+            .header-text h1 { font-size: 19px; }
+            .header-subtitle { font-size: 9px; letter-spacing: 0.09em; }
+            .header-update { gap: 4px; }
+            .update-label { font-size: 8px; }
+            .update-value { font-size: 11px; }
+            .environment-grid { grid-template-columns: minmax(0, 1fr); gap: 14px; margin: 14px 0; }
+            .environment-card { min-height: 280px; padding: 20px; }
+            .reading .value, .reading #temp, .reading #hum { font-size: 36px; }
+            .lunar-card { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; padding: 20px; }
+            .lunar-overview { grid-column: 1 / -1; }
+            .lunar-event { border-left: 0; border-top: 1px solid rgba(255,255,255,0.08); padding: 15px 0 0; }
+            .lunar-event .value-ios { font-size: 16px; }
+            .chart-block { min-width: 0; width: 100%; flex-basis: 100%; }
+            .charts { gap: 18px; }
+            canvas { max-width: 100%; }
+        }
 
-            .climate-section,
-            .lunar-section {
-                min-width: 0;
-                width: 100%;
-                padding: 0;
-            }
-
-            .climate-section {
-                border-bottom: 1px solid rgba(255, 255, 255, 0.12);
-                padding-bottom: 12px;
-                margin-bottom: 6px;
-            }
-
-            .lunar-section {
-                text-align: center;
-            }
-
-            .lunar-header {
-                justify-content: center;
-            }
-
-            .lunar-row {
-                justify-content: center;
-                gap: 10px;
-            }
+        @media (max-width: 400px) {
+            .panel.header-panel { flex-direction: column; align-items: flex-start; }
+            .header-update { align-items: flex-start; margin-left: 41px; }
+            .card-heading { flex-wrap: wrap; gap: 10px; }
+            .weather-status { margin-left: 42px; }
+            .environment-card { padding: 18px; }
+            .reading .value, .reading #temp, .reading #hum { font-size: 34px; }
+            .extrema-row { font-size: 12px; }
         }
 
         .panel-csv {
@@ -1733,72 +1867,78 @@ void loop() {
             </div>
         </div>
         <div class="header-update">
-            <span class="update-label">Última actualización</span>
+            <span class="update-label">Actualización de pantalla</span>
             <span id="time" class="update-value">--/--/---- --:--:--</span>
         </div>
     </div>
 
-    <!-- Panel principal: Clima + Fase Lunar en una sola tarjeta horizontal -->
-    <div class="panel panel-main">
-        <!-- ==================== SECCIÓN CLIMA ==================== -->
-        <div class="climate-section">
-            <div class="section-title">
-                <span class="icon icon-temp">wb_sunny</span>
-                Temperatura
+    <main class="monitoring-layout">
+    <section class="environment-grid" aria-label="Monitoreo ambiental">
+        <article class="panel environment-card" aria-labelledby="localTitle">
+            <header class="card-heading">
+                <div class="card-title-group">
+                    <span class="material-symbols-rounded card-symbol" aria-hidden="true">sensors</span>
+                    <div>
+                        <h2 id="localTitle">Sensor local</h2>
+                        <p class="card-subtitle">DHT22 · ESP8266</p>
+                    </div>
+                </div>
+            </header>
+            <div class="metric-grid">
+                <div>
+                    <div class="section-title"><span class="icon icon-temp" aria-hidden="true">wb_sunny</span>Temperatura</div>
+                    <div class="reading"><span id="temp" class="value temp-reading">--.-</span><span class="reading-unit">°C</span></div>
+                </div>
+                <div>
+                    <div class="section-title"><span class="icon icon-hum" aria-hidden="true">water_drop</span>Humedad</div>
+                    <div class="reading"><span id="hum" class="value hum-reading">--.-</span><span class="reading-unit">%</span></div>
+                </div>
             </div>
-            <div class="label">Actual: <span id="temp" class="value">--.-</span> °C</div>
-
-            <hr>
-
-            <div class="section-title">
-                <span class="icon icon-hum">water_drop</span>
-                Humedad
+            <div class="card-details">
+                <div class="extrema-row"><span>Temperatura mín. / máx.</span><span class="extrema-values"><span id="tmin" class="value">--.-</span> / <span id="tmax" class="value">--.-</span> °C</span></div>
+                <div class="extrema-row"><span>Humedad mín. / máx.</span><span class="extrema-values"><span id="hmin" class="value">--.-</span> / <span id="hmax" class="value">--.-</span> %</span></div>
             </div>
-            <div class="label">Actual: <span id="hum" class="value">--.-</span> %</div>
+        </article>
 
-            <hr>
-
-            <div class="label">
-                Temp Min/Max:
-                <span id="tmin" class="value">--.-</span> /
-                <span id="tmax" class="value">--.-</span> °C
+        <article class="panel environment-card" aria-labelledby="weatherTitle">
+            <header class="card-heading">
+                <div class="card-title-group">
+                    <span class="material-symbols-rounded card-symbol" aria-hidden="true">partly_cloudy_day</span>
+                    <div>
+                        <h2 id="weatherTitle">Clima exterior</h2>
+                        <p class="card-subtitle">Corrientes · WeatherAPI</p>
+                    </div>
+                </div>
+                <span id="weatherStatus" class="weather-status" data-state="empty" role="status">Sin datos</span>
+            </header>
+            <div class="metric-grid">
+                <div>
+                    <div class="section-title"><span class="icon icon-temp" aria-hidden="true">wb_sunny</span>Temperatura</div>
+                    <div class="reading"><span id="weatherTemp" class="value temp-reading">--</span><span class="reading-unit">°C</span></div>
+                </div>
+                <div>
+                    <div class="section-title"><span class="icon icon-hum" aria-hidden="true">water_drop</span>Humedad</div>
+                    <div class="reading"><span id="weatherHum" class="value hum-reading">--</span><span class="reading-unit">%</span></div>
+                </div>
             </div>
+            <div class="card-details">
+                <div class="weather-location"><span class="material-symbols-rounded" aria-hidden="true">location_on</span>Corrientes, Argentina</div>
+                <div class="weather-updated"><span>Última consulta exitosa</span><time id="weatherUpdated">Sin datos</time></div>
+            </div>
+        </article>
+    </section>
 
-            <div class="label">
-                Hum Min/Max:
-                <span id="hmin" class="value">--.-</span> /
-                <span id="hmax" class="value">--.-</span> %
+    <section class="panel lunar-card" aria-label="Fases lunares">
+        <div class="lunar-overview">
+            <span id="moonIcon" class="moon-emoji" aria-hidden="true">🌑</span>
+            <div>
+                <div class="lunar-header"><span class="lunar-icon-title" aria-hidden="true">nightlight</span><span class="lunar-title">Fase Lunar</span></div>
+                <div class="lunar-phase-name"><span id="moonName">--</span></div>
             </div>
         </div>
-
-        <!-- ==================== SECCIÓN LUNAR ==================== -->
-        <div class="lunar-section">
-            <div class="lunar-header">
-                <span class="lunar-icon-title">nightlight</span>
-                <span class="lunar-title">Fase Lunar</span>
-            </div>
-
-            <div class="lunar-moon-icon">
-                <span id="moonIcon" class="moon-emoji">🌑</span>
-            </div>
-
-            <div class="lunar-phase-name">
-                <span id="moonName">--</span>
-            </div>
-
-            <div class="divider"></div>
-
-            <div class="lunar-row">
-                <span class="label-ios">Próxima Luna Nueva</span>
-                <span id="nextNewMoon" class="value-ios">--/--/----</span>
-            </div>
-
-            <div class="lunar-row">
-                <span class="label-ios">Próxima Luna Llena</span>
-                <span id="nextFullMoon" class="value-ios">--/--/----</span>
-            </div>
-        </div>
-    </div>
+        <div class="lunar-event"><span class="label-ios">Próxima luna nueva</span><span id="nextNewMoon" class="value-ios">--/--/----</span></div>
+        <div class="lunar-event"><span class="label-ios">Próxima luna llena</span><span id="nextFullMoon" class="value-ios">--/--/----</span></div>
+    </section>
 
     <!-- ===========================
              GRÁFICOS
@@ -1806,22 +1946,22 @@ void loop() {
     <div class="charts">
         <div class="chart-block">
             <h3>Temperatura (últimos segundos)</h3>
-            <canvas id="tempChart"></canvas>
+            <div class="chart-canvas"><canvas id="tempChart"></canvas></div>
         </div>
         <div class="chart-block">
             <h3>Humedad (últimos segundos)</h3>
-            <canvas id="humChart"></canvas>
+            <div class="chart-canvas"><canvas id="humChart"></canvas></div>
         </div>
     </div>
 
     <div class="charts">
         <div class="chart-block">
             <h3>Temperatura (última hora)</h3>
-            <canvas id="tempHourChart"></canvas>
+            <div class="chart-canvas"><canvas id="tempHourChart"></canvas></div>
         </div>
         <div class="chart-block">
             <h3>Humedad (última hora)</h3>
-            <canvas id="humHourChart"></canvas>
+            <div class="chart-canvas"><canvas id="humHourChart"></canvas></div>
         </div>
     </div>
 
@@ -2029,6 +2169,22 @@ void loop() {
             chart.update();
         }
 
+        function actualizarClimaExterior(weather, offline = false) {
+            const status = document.getElementById('weatherStatus');
+            if (offline) {
+                status.textContent = 'Sin conexión local';
+                status.dataset.state = 'stale';
+                return;
+            }
+            const valid = weather && weather.valid === true &&
+                Number.isFinite(weather.temp) && Number.isFinite(weather.hum);
+            document.getElementById('weatherTemp').textContent = valid ? weather.temp.toFixed(1) : '--';
+            document.getElementById('weatherHum').textContent = valid ? weather.hum.toFixed(0) : '--';
+            document.getElementById('weatherUpdated').textContent = valid ? (weather.updated || 'Sin fecha') : 'Sin datos';
+            status.textContent = !valid ? 'Sin datos' : (weather.stale ? 'Datos anteriores' : 'Datos disponibles');
+            status.dataset.state = !valid ? 'empty' : (weather.stale ? 'stale' : 'current');
+        }
+
         function actualizarDatos() {
             fetch('/data')
                 .then(r => r.json())
@@ -2040,6 +2196,7 @@ void loop() {
                     document.getElementById('hmin').textContent = d.hmin.toFixed(0);
                     document.getElementById('hmax').textContent = d.hmax.toFixed(0);
                     document.getElementById('time').textContent = d.time;
+                    actualizarClimaExterior(d.weather);
 
                     document.getElementById('moonIcon').textContent = d.moonIcon;
                     document.getElementById('moonName').textContent = d.moonName;
@@ -2097,7 +2254,10 @@ void loop() {
                     tempHourChart.update();
                     humHourChart.update();
                 })
-                .catch(err => console.error('Error al obtener /data', err));
+                .catch(err => {
+                    console.error('Error al obtener /data', err);
+                    actualizarClimaExterior(null, true);
+                });
         }
 
         window.addEventListener('load', () => {
@@ -2148,6 +2308,8 @@ void loop() {
         </div>
     </div>
 
+    </main>
+
     <div class="footer">by: Luciano Aromi</div>
 
     <script>
@@ -2171,7 +2333,7 @@ void loop() {
 <!-- ============================================================================================= -->
 
 
-)rawliteral");
+)rawliteral"));
 
   client.stop();
 }
