@@ -22,6 +22,7 @@
 #include "secrets.h"
 #include "tls_certificates.h"
 #include "weather_json.h"
+#include "wifi_provisioning.h"
 
 // Diagnostico temporal: cambiar a 0 para compilar sin trazas de conexion.
 #define DIAGNOSTICO_CONEXIONES 1
@@ -162,9 +163,15 @@ unsigned long lastAlert = 0;                 // tiempo del último aviso
 const unsigned long ALERT_INTERVAL = 300000; // 5 MINUTOS
 
 WiFiServer server(80);
+WifiProvisioning wifiProvisioning;
+bool serviciosRedIniciados = false;
+// Diagnostico temporal: eventos STA sin SSID, claves ni otros datos sensibles.
+WiFiEventHandler wifiAsociadaDiag;
+WiFiEventHandler wifiDesconectadaDiag;
+WiFiEventHandler wifiIpv4Diag;
+WiFiEventHandler wifiDhcpDiag;
 
 // TLS se ejecuta de a una conexion y solo cuando no hay un cliente HTTP pendiente.
-const unsigned long WIFI_START_TIMEOUT_MS = 15000UL;
 const unsigned long EXTERNAL_RETRY_MS = 30000UL;
 const uint16_t EXTERNAL_IO_TIMEOUT_MS = 5000;
 const time_t MIN_TLS_TIME = 1704067200; // 01/01/2024 UTC: control de plausibilidad
@@ -183,6 +190,7 @@ bool horaValidaParaTLS() {
 }
 
 bool puedeIniciarTLS() {
+  if (!serviciosRedIniciados || wifiProvisioning.portalActive()) return false;
   if (WiFi.status() != WL_CONNECTED || !horaValidaParaTLS()) return false;
   // RX de 16 KiB evita depender de MFLN. Reservar margen para TLS y las estructuras JSON.
   return ESP.getFreeHeap() >= 35000 && ESP.getMaxFreeBlockSize() >= 17000;
@@ -819,6 +827,7 @@ bool actualizarClimaApi() {
 // Sin espera de NTP en loop(): el callback del core habilita TLS cuando llega la hora.
 // Cada llamada ejecuta como maximo una operacion externa, sin conexiones TLS simultaneas.
 void atenderServiciosExternos() {
+  if (!serviciosRedIniciados || wifiProvisioning.portalActive()) return;
   unsigned long ahora = millis();
   bool telegramPendiente = avisoInicioPendiente || alertaPendiente.length() > 0;
   bool weatherPendiente = climaInicialPendiente || ahora - lastWeatherCheck >= WEATHER_INTERVAL;
@@ -999,6 +1008,7 @@ void obtenerFechasCSV(String &primera, String &ultima) {
 // =============================
 void setup() {
   Serial.begin(115200);
+  WifiProvisioning::memory(F("ARRANQUE"));
   dht.begin();
 
   pinMode(LED_API, OUTPUT);
@@ -1011,25 +1021,23 @@ void setup() {
               F("PENDIENTE"), F("aviso de inicio"));
   DIAG_ESTADO(ServicioDiag::WeatherAPI, EstadoDiag::Pendiente,
               F("PENDIENTE"), F("primera consulta"));
-  WiFi.setAutoReconnect(true);
+  wifiAsociadaDiag = WiFi.onStationModeConnected([](const WiFiEventStationModeConnected &) {
+    Serial.print(F("[WM +")); Serial.print(millis()); Serial.println(F(" ms] STA_ASOCIADA"));
+  });
+  wifiDesconectadaDiag = WiFi.onStationModeDisconnected([](const WiFiEventStationModeDisconnected &event) {
+    Serial.print(F("[WM +")); Serial.print(millis());
+    Serial.print(F(" ms] STA_DESCONECTADA motivo="));
+    Serial.println(static_cast<int>(event.reason));
+  });
+  wifiIpv4Diag = WiFi.onStationModeGotIP([](const WiFiEventStationModeGotIP &) {
+    Serial.print(F("[WM +")); Serial.print(millis()); Serial.println(F(" ms] STA_IPV4_OBTENIDA"));
+  });
+  wifiDhcpDiag = WiFi.onStationModeDHCPTimeout([]() {
+    Serial.print(F("[WM +")); Serial.print(millis()); Serial.println(F(" ms] STA_DHCP_TIMEOUT"));
+  });
   DIAG_INICIO_WIFI();
-  WiFi.begin(ssid, password);
+  wifiProvisioning.begin(WIFI_CONFIG_AP_PASSWORD, ssid, password);
   ultimoIntentoWifi = millis();
-  Serial.print("Conectando a WiFi...");
-  while (WiFi.status() != WL_CONNECTED &&
-         millis() - ultimoIntentoWifi < WIFI_START_TIMEOUT_MS) {
-    delay(500);
-    Serial.print(".");
-  }
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println(" conectado!");
-    Serial.print("IP: ");
-    Serial.println(WiFi.localIP());
-  } else {
-    Serial.println(" sin conexion; se reintentara sin detener las mediciones.");
-    DIAG_WIFI_INICIO_FALLIDO();
-  }
-  DIAG_OBSERVAR_WIFI();
 
   settimeofday_cb([](bool desdeSntp) {
     if (desdeSntp) {
@@ -1037,10 +1045,6 @@ void setup() {
       DIAG_MARCAR_NTP();
     }
   });
-  DIAG_INICIO_NTP();
-  configTime(-3 * 3600, 0, "pool.ntp.org", "time.nist.gov");
-  Serial.println("[NTP] TLS pendiente hasta recibir una hora valida; sin espera bloqueante.");
-
   for (int i = 0; i < HOUR_POINTS; i++) {
     histTemp[i] = NAN;
     histHum[i]  = NAN;
@@ -1055,7 +1059,7 @@ void setup() {
     Serial.println("❌ Error montando SPIFFS.");
   }
 
-  server.begin();
+  // HTTP y NTP se inician desde loop() al obtener IPv4 y cerrar el portal.
 
   // La notificacion de inicio y la primera consulta se atienden desde loop().
 
@@ -1096,6 +1100,17 @@ void imprimirClimaExterior(Print &output) {
 }
 
 void loop() {
+  wifiProvisioning.process();
+  if (!serviciosRedIniciados && wifiProvisioning.ready()) {
+    // WiFiManager ya fue destruido: unico servidor en TCP 80.
+    server.begin();
+    serviciosRedIniciados = true;
+    Serial.print(F("[WM] HTTP listo; IPv4="));
+    Serial.println(WiFi.localIP());
+    DIAG_INICIO_NTP();
+    configTime(-3 * 3600, 0, "pool.ntp.org", "time.nist.gov");
+    Serial.println(F("[NTP] TLS pendiente hasta recibir una hora valida; sin espera bloqueante."));
+  }
   unsigned long ahora = millis();
   DIAG_OBSERVAR_NTP();
   DIAG_OBSERVAR_WIFI();
@@ -1139,6 +1154,7 @@ void loop() {
   // =============================
   // SERVIDOR WEB
   // =============================
+  if (!serviciosRedIniciados || wifiProvisioning.portalActive()) return;
   WiFiClient client = server.available();
   if (!client) {
     atenderServiciosExternos();

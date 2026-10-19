@@ -63,12 +63,22 @@ void finDiag(ServicioDiag servicio, unsigned long inicio, bool exito,
   Serial.print(exito ? F("exito") : (huboIntento ? F("error") : F("sin_intento")));
   Serial.print(F(" duracion_ms="));
   Serial.println(millis() - inicio);
+  prefijoDiag(nombreServicioDiag(servicio), millis());
+  Serial.print(F("MEMORIA despues_operacion libre="));
+  Serial.print(ESP.getFreeHeap());
+  Serial.print(F(" bloque_max="));
+  Serial.println(ESP.getMaxFreeBlockSize());
 }
 
 void conexionTlsDiag(ServicioDiag servicio, unsigned long inicio) {
   prefijoDiag(nombreServicioDiag(servicio), millis());
   Serial.print(F("CONEXION_TLS exitosa duracion_conexion_ms="));
   Serial.println(millis() - inicio);
+  prefijoDiag(nombreServicioDiag(servicio), millis());
+  Serial.print(F("MEMORIA conexion_TLS_activa libre="));
+  Serial.print(ESP.getFreeHeap());
+  Serial.print(F(" bloque_max="));
+  Serial.println(ESP.getMaxFreeBlockSize());
 }
 
 void cabecerasWeatherDiag(int codigo, unsigned long inicio) {
@@ -77,6 +87,11 @@ void cabecerasWeatherDiag(int codigo, unsigned long inicio) {
   Serial.print(codigo);
   Serial.print(F(" duracion_hasta_cabeceras_ms="));
   Serial.println(millis() - inicio);
+  prefijoDiag(F("WeatherAPI"), millis());
+  Serial.print(F("MEMORIA despues_GET libre="));
+  Serial.print(ESP.getFreeHeap());
+  Serial.print(F(" bloque_max="));
+  Serial.println(ESP.getMaxFreeBlockSize());
 }
 
 void reconexionWifiDiag() {
