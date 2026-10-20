@@ -23,6 +23,7 @@
 #include "tls_certificates.h"
 #include "weather_json.h"
 #include "wifi_provisioning.h"
+#include "http_timing_diagnostics.h"
 
 // Diagnostico temporal: cambiar a 0 para compilar sin trazas de conexion.
 #define DIAGNOSTICO_CONEXIONES 1
@@ -73,14 +74,14 @@ DHT dht(SENSOR, DHTTYPE);
 void actualizarLedRain(unsigned long ahora);
 void actualizarPatronLluvia();
 
-// Variables globales (valor crudo promediado)
+// Variables globales (ultima lectura valida con offsets)
 float TEMPERATURA = 0;
 float HUMEDAD     = 0;
 
 // Variables filtradas (suavizadas)
 float tempFiltrada = NAN;
 float humFiltrada  = NAN;
-const float ALPHA_FILTRO = 0.2;   // 0.1 = más suave, 0.5 = más rápido
+const float ALPHA_FILTRO = 0.5;   // 0.1 = más suave, 0.5 = más rápido
 
 float tempMax = -100, tempMin = 200;
 float humMax  = 0,    humMin  = 100;
@@ -90,7 +91,7 @@ unsigned long lastRead = 0;
 // =============================
 // INTERVALOS DE TIEMPO
 // =============================
-const unsigned long READ_INTERVAL_MS      = 10000UL;  // 10 segundos
+const unsigned long READ_INTERVAL_MS      = 2500UL;   // 2,5 segundos (DHT: minimo 2 s)
 const unsigned long HIST_MINUTE_INTERVAL  = 60000UL;  // 1 minuto
 const unsigned long CSV_SAVE_INTERVAL_MS  = 300000UL; // 5 minutos
 
@@ -213,6 +214,21 @@ const char* LOG_FILE = "/historial.csv";
 const unsigned long MAX_LOG_LINES = 8640UL; // 24 × 60 / 5 * 30
 bool spiffsOk = false;
 unsigned long logLines = 0;
+char primeraFechaCSV[11] = "";
+char ultimaFechaCSV[11] = "";
+
+void reiniciarFechasCSV() {
+  primeraFechaCSV[0] = '\0';
+  ultimaFechaCSV[0] = '\0';
+}
+
+void registrarFechaCSV(const String &linea) {
+  if (linea.length() <= 5) return;
+  if (primeraFechaCSV[0] == '\0') {
+    linea.toCharArray(primeraFechaCSV, sizeof(primeraFechaCSV));
+  }
+  linea.toCharArray(ultimaFechaCSV, sizeof(ultimaFechaCSV));
+}
 
 // =============================
 // HORA NTP (ARGENTINA GMT-3)
@@ -350,28 +366,13 @@ void actualizarFiltro() {
 // LECTURA DEL DHT22
 // =============================
 bool leerDHT() {
-  float sumaT = 0, sumaH = 0;
-  int muestras = 10;
-  int validas  = 0;
+  // DHT conserva la trama durante 2 s: ambos valores pertenecen a una sola lectura.
+  const float t = dht.readTemperature();
+  const float h = dht.readHumidity();
+  if (isnan(t) || isnan(h)) return false;
 
-  for (int i = 0; i < muestras; i++) {
-    float t = dht.readTemperature();
-    float h = dht.readHumidity();
-
-    if (!isnan(t) && !isnan(h)) {
-      sumaT += t;
-      sumaH += h;
-      validas++;
-    }
-    // Evitar pausar demasiado el parpadeo del LED de lluvia
-    actualizarLedRain(millis());
-    delay(10);
-  }
-
-  if (validas == 0) return false;
-
-  TEMPERATURA = sumaT / validas;
-  HUMEDAD     = sumaH / validas;
+  TEMPERATURA = t;
+  HUMEDAD     = h;
 
   TEMPERATURA += OFFSET_TEMP;
   HUMEDAD     += OFFSET_HUM;
@@ -399,6 +400,7 @@ bool leerDHT() {
 // INICIALIZAR LOG EN SPIFFS
 // =============================
 void iniciarLog() {
+  reiniciarFechasCSV();
   if (!SPIFFS.exists(LOG_FILE)) {
     File f = SPIFFS.open(LOG_FILE, "w");
     if (f) {
@@ -427,6 +429,7 @@ void iniciarLog() {
       continue;
     }
     if (line.length() > 1) logLines++;
+    registrarFechaCSV(line);
   }
 
   f.close();
@@ -447,20 +450,27 @@ void agregarRegistroLog(const String &fechaHora, float t, float h) {
     return;
   }
 
-  f.printf("%s,%.1f,%.0f\r\n", fechaHora.c_str(), t, h);
+  const size_t bytesEscritos = f.printf("%s,%.1f,%.0f\r\n", fechaHora.c_str(), t, h);
+  const bool escrito = bytesEscritos > 0 && f.getWriteError() == 0;
   f.close();
+  if (!escrito) return;
 
   logLines++;
+  registrarFechaCSV(fechaHora);
 
   if (logLines >= MAX_LOG_LINES) {
     Serial.println("Limite de 1 mes alcanzado, reiniciando log...");
-    SPIFFS.remove(LOG_FILE);
+    bool reiniciado = SPIFFS.remove(LOG_FILE);
     File nf = SPIFFS.open(LOG_FILE, "w");
     if (nf) {
       nf.println("FechaHora,Temperatura,Hum.edad");
       nf.close();
+      reiniciado = true;
     }
-    logLines = 0;
+    if (reiniciado) {
+      logLines = 0;
+      reiniciarFechasCSV();
+    }
   }
 }
 
@@ -928,10 +938,12 @@ void atenderServiciosExternos() {
 // CSV nombre e info
 // =============================
 String obtenerNombreCSV() {
+  PERF_CSV_BEGIN(F("CSV_NOMBRE"));
   if (!SPIFFS.exists(LOG_FILE)) return "historial_vacio.csv";
 
   File f = SPIFFS.open(LOG_FILE, "r");
   if (!f) return "historial_error.csv";
+  PERF_CSV_OPEN(f.size());
 
   String linea;
   String primeraFecha = "";
@@ -941,6 +953,7 @@ String obtenerNombreCSV() {
 
   while (f.available()) {
     linea = f.readStringUntil('\n');
+    PERF_CSV_LINE();
 
     if (esCabecera) {
       esCabecera = false;
@@ -974,31 +987,9 @@ String obtenerNombreCSV() {
 }
 
 void obtenerFechasCSV(String &primera, String &ultima) {
-  primera = "";
-  ultima  = "";
-
-  if (!SPIFFS.exists(LOG_FILE)) return;
-
-  File f = SPIFFS.open(LOG_FILE, "r");
-  if (!f) return;
-
-  String linea;
-  bool esCabecera = true;
-
-  while (f.available()) {
-    linea = f.readStringUntil('\n');
-
-    if (esCabecera) {
-      esCabecera = false;
-      continue;
-    }
-
-    if (linea.length() > 5) {
-      if (primera == "") primera = linea.substring(0, 10);
-      ultima = linea.substring(0, 10);
-    }
-  }
-  f.close();
+  PERF_CSV_BEGIN(F("CSV_FECHAS"));
+  primera = primeraFechaCSV;
+  ultima = ultimaFechaCSV;
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -1121,6 +1112,7 @@ void loop() {
 // 2) Lectura DHT + alerta
   if (ahora - lastRead > READ_INTERVAL_MS) {
     lastRead = ahora;
+    PERF_DHT_ATTEMPT();
 
     if (leerDHT()) {
       float tUso = isnan(tempFiltrada) ? TEMPERATURA : tempFiltrada;
@@ -1160,11 +1152,13 @@ void loop() {
     atenderServiciosExternos();
     return;
   }
+  PERF_HTTP_REQUEST();
   DIAG_CLIENTE_HTTP(millis());
 
   unsigned long timeout = millis();
   while (!client.available()) {
     if (millis() - timeout > 500) {
+      PERF_HTTP_PHASE(Cierre);
       client.stop();
       return;
     }
@@ -1173,6 +1167,7 @@ void loop() {
     delay(1);
   }
 
+  PERF_HTTP_PHASE(Recepcion);
   String requestLine = client.readStringUntil('\r');
   client.read(); // '\n'
 
@@ -1182,13 +1177,16 @@ void loop() {
     if (header.length() == 1) break;
   }
 
+  PERF_HTTP_PHASE(Preparacion);
   // /data
   if (requestLine.indexOf("GET /data") >= 0) {
+    PERF_HTTP_ROUTE(F("/data"));
     String fechaHora = obtenerFechaHora();
 
     float tOut = isnan(tempFiltrada) ? TEMPERATURA : tempFiltrada;
     float hOut = isnan(humFiltrada)  ? HUMEDAD     : humFiltrada;
 
+    PERF_HTTP_PHASE(Respuesta);
     client.println("HTTP/1.1 200 OK");
     client.println("Content-Type: application/json");
     client.println("Connection: close");
@@ -1218,7 +1216,9 @@ void loop() {
     client.print(faseNombre(f));
 
     String lunaNueva, lunaLlena;
+    PERF_HTTP_MOON_BEGIN();
     calcularLunas(lunaNueva, lunaLlena);
+    PERF_HTTP_MOON_END();
 
     client.print("\",\"nextNewMoon\":\"");
     client.print(lunaNueva);
@@ -1243,33 +1243,40 @@ void loop() {
     imprimirClimaExterior(client);
     client.println("}");
 
+    PERF_HTTP_PHASE(Cierre);
     client.stop();
     return;
   }
 
   // /csv
   if (requestLine.startsWith("GET /csv ")) {
+    PERF_HTTP_ROUTE(F("/csv"));
     if (!spiffsOk || !SPIFFS.exists(LOG_FILE)) {
+      PERF_HTTP_PHASE(Respuesta);
       client.println("HTTP/1.1 500 Internal Server Error");
       client.println("Content-Type: text/plain");
       client.println("Connection: close");
       client.println();
       client.println("Log no disponible");
+      PERF_HTTP_PHASE(Cierre);
       client.stop();
       return;
     }
 
     File f = SPIFFS.open(LOG_FILE, "r");
     if (!f) {
+      PERF_HTTP_PHASE(Respuesta);
       client.println("HTTP/1.1 500 Internal Server Error");
       client.println("Content-Type: text/plain");
       client.println("Connection: close");
       client.println();
       client.println("No se pudo abrir el log");
+      PERF_HTTP_PHASE(Cierre);
       client.stop();
       return;
     }
 
+    PERF_HTTP_PHASE(Respuesta);
     client.println("HTTP/1.1 200 OK");
     client.println("Content-Type: text/csv");
     client.println("Content-Disposition: attachment; filename=\"" + obtenerNombreCSV() + "\"");
@@ -1283,40 +1290,51 @@ void loop() {
     }
 
     f.close();
+    PERF_HTTP_PHASE(Cierre);
     client.stop();
     return;
   }
 
   // /clearcsv
   if (requestLine.startsWith("GET /clearcsv ")) {
+    PERF_HTTP_ROUTE(F("/clearcsv"));
+    bool reiniciado = false;
     if (spiffsOk && SPIFFS.exists(LOG_FILE)) {
-      SPIFFS.remove(LOG_FILE);
+      reiniciado = SPIFFS.remove(LOG_FILE);
     }
 
     File nf = SPIFFS.open(LOG_FILE, "w");
     if (nf) {
       nf.println("FechaHora,Temperatura,Hum.edad");
       nf.close();
+      reiniciado = true;
     }
 
-    logLines = 0;
+    if (reiniciado) {
+      logLines = 0;
+      reiniciarFechasCSV();
+    }
 
     Serial.println("🗑️ Historial CSV borrado manualmente.");
 
+    PERF_HTTP_PHASE(Respuesta);
     client.println("HTTP/1.1 200 OK");
     client.println("Content-Type: text/plain");
     client.println("Connection: close");
     client.println();
     client.println("CSV borrado correctamente");
+    PERF_HTTP_PHASE(Cierre);
     client.stop();
     return;
   }
 
   // /csvinfo
   if (requestLine.startsWith("GET /csvinfo ")) {
+    PERF_HTTP_ROUTE(F("/csvinfo"));
     String f1, f2;
     obtenerFechasCSV(f1, f2);
 
+    PERF_HTTP_PHASE(Respuesta);
     client.println("HTTP/1.1 200 OK");
     client.println("Content-Type: application/json");
     client.println("Connection: close");
@@ -1325,11 +1343,14 @@ void loop() {
     client.print("{\"first\":\"" + f1 + "\",");
     client.print("\"last\":\"" + f2 + "\"}");
 
+    PERF_HTTP_PHASE(Cierre);
     client.stop();
     return;
   }
 
   // Página principal (HTML simple de prueba)
+  PERF_HTTP_ROUTE(F("HTML"));
+  PERF_HTTP_PHASE(Respuesta);
   client.println("HTTP/1.1 200 OK");
   client.println("Content-Type: text/html");
   client.println("Connection: close");
@@ -1986,25 +2007,6 @@ void loop() {
         let tempHourChart, humHourChart;
 
         const HOUR_POINTS = 60;
-        let bufferTemp = [];
-        let bufferHum = [];
-
-        function smoothEWMA(values, alpha = 0.2) {
-            if (values.length < 2) {
-                return values[values.length - 1];
-            }
-
-            let prev = values[0];
-            let smoothed = prev;
-
-            for (let i = 1; i < values.length; i++) {
-                smoothed = alpha * values[i] + (1 - alpha) * prev;
-                prev = smoothed;
-            }
-
-            return smoothed;
-        }
-
         function crearGraficos() {
             const tctx = document.getElementById('tempChart').getContext('2d');
             const hctx = document.getElementById('humChart').getContext('2d');
@@ -2018,7 +2020,7 @@ void loop() {
                         data: [],
                         borderColor: 'rgba(255,99,132,1)',
                         backgroundColor: 'rgba(255,99,132,0.25)',
-                        tension: 0.4,
+                        tension: 0,
                         pointRadius: 0
                     }]
                 },
@@ -2039,6 +2041,7 @@ void loop() {
                                 lineWidth: 1
                             },
                             ticks: {
+                                stepSize: 0.5,
                                 callback: function (v) {
                                     return v.toFixed(1);
                                 }
@@ -2185,6 +2188,33 @@ void loop() {
             chart.update();
         }
 
+        function actualizarEscalaTemperatura() {
+            const valores = tempChart.data.datasets[0].data;
+            if (!valores.length) return;
+
+            const minimo = Math.min(...valores);
+            const maximo = Math.max(...valores);
+            const eje = tempChart.options.scales.y;
+
+            if (eje.min === undefined || eje.max === undefined) {
+                const centro = Math.round(((minimo + maximo) / 2) * 2) / 2;
+                eje.min = centro - 1.5;
+                eje.max = centro + 1.5;
+            }
+
+            if (minimo <= eje.min || maximo >= eje.max ||
+                (eje.max - eje.min > 3 && maximo - minimo <= 1)) {
+                if (maximo - minimo <= 1) {
+                    const centro = Math.round(((minimo + maximo) / 2) * 2) / 2;
+                    eje.min = centro - 1.5;
+                    eje.max = centro + 1.5;
+                } else {
+                    eje.min = Math.floor((minimo - 0.5) * 2) / 2;
+                    eje.max = Math.max(eje.min + 3, Math.ceil((maximo + 0.5) * 2) / 2);
+                }
+            }
+        }
+
         function actualizarClimaExterior(weather, offline = false) {
             const status = document.getElementById('weatherStatus');
             if (offline) {
@@ -2219,28 +2249,13 @@ void loop() {
                     document.getElementById('nextNewMoon').textContent = d.nextNewMoon;
                     document.getElementById('nextFullMoon').textContent = d.nextFullMoon;
 
-                    bufferTemp.push(d.temp);
-                    bufferHum.push(d.hum);
+                    agregarPunto(tempChart, d.time, d.temp, 40);
+                    agregarPunto(humChart, d.time, d.hum, 40);
 
-                    if (bufferTemp.length > 50) {
-                        bufferTemp.shift();
-                    }
+                    actualizarEscalaTemperatura();
 
-                    if (bufferHum.length > 50) {
-                        bufferHum.shift();
-                    }
-
-                    const tempSmoothed = smoothEWMA(bufferTemp, 0.2);
-                    const humSmoothed = smoothEWMA(bufferHum, 0.2);
-
-                    agregarPunto(tempChart, d.time, tempSmoothed, 40);
-                    agregarPunto(humChart, d.time, humSmoothed, 40);
-
-                    tempChart.options.scales.y.min = tempSmoothed - 0.5;
-                    tempChart.options.scales.y.max = tempSmoothed + 0.5;
-
-                    humChart.options.scales.y.min = humSmoothed - 2;
-                    humChart.options.scales.y.max = humSmoothed + 2;
+                    humChart.options.scales.y.min = d.hum - 2;
+                    humChart.options.scales.y.max = d.hum + 2;
 
                     tempChart.update();
                     humChart.update();
@@ -2351,5 +2366,6 @@ void loop() {
 
 )rawliteral"));
 
+  PERF_HTTP_PHASE(Cierre);
   client.stop();
 }

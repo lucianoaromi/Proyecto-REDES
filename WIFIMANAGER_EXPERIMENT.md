@@ -124,7 +124,7 @@ La configuracion SSID/clave sirve para redes personales compatibles con ESP8266
 La validacion TLS conserva **35.000 bytes libres** y **17.000 de bloque contiguo**
 como requisitos previos; si no se alcanzan, los servicios se aplazan.
 
-## Memoria y resultados de compilacion
+## Memoria y resultados de compilacion anteriores al ajuste DHT
 
 Ambas compilaciones finalizaron correctamente con credenciales ficticias. La
 comparacion usa el commit de partida en una carpeta temporal y el prototipo real,
@@ -154,8 +154,9 @@ sin medir. Las cifras anteriores no justifican reducir los requisitos de TLS.
   El modelo reproduce la prioridad de handlers revisada en el core;
   no sustituye pruebas de HTTP, radio, flash ni heap en la placa.
 
-- **25 funciones** originales comparadas sin diferencias, ademas de certificados,
-  parser JSON, umbrales y servidor completo (HTML/CSS/JS y rutas CSV intactos).
+- **24 funciones** originales comparadas sin diferencias, ademas de certificados,
+  parser JSON y umbrales. El servidor y la interfaz solo admiten los cambios DHT
+  descritos abajo; se conservan el diseno, las rutas y el formato de `/data`.
 - Suite meteorologica existente: **234 casos aprobados**.
 - Suite existente del endpoint: **8 respuestas aprobadas**.
 - `secrets.h` no esta versionado y coincide con la exclusion de `.gitignore`.
@@ -254,3 +255,255 @@ La aprobacion definitiva queda pendiente de resolver o caracterizar la demora
 intermitente de IPv4 y de completar los escenarios indicados. El traspaso de TCP
 80, la persistencia tras reinicio y HTTPS posterior ya fueron observados en las
 primeras pruebas. El prototipo permanece separado de la version estable.
+
+## Respuesta del DHT22 y graficas (19/10/2026)
+
+El intervalo nominal cambia de 10 s a 2,5 s y el filtro exponencial del firmware
+de 0,2 a 0,5. La biblioteca Adafruit DHT 1.4.6 instalada conserva el resultado
+durante 2000 ms (`DHT.cpp`, `MIN_INTERVAL` y `DHT::read`). Las diez iteraciones
+con pausas de 10 ms reutilizaban la misma trama; ahora se solicita una pareja
+temperatura/humedad por ciclo, sin forzar la lectura. Se eliminan esas pausas
+(100 ms por ciclo). Si cualquiera de los valores es NaN, se conserva la ultima
+pareja valida y no se actualizan filtro, extremos, historial ni alertas.
+
+Las graficas de tiempo real usan directamente `d.temp` y `d.hum` de `/data`.
+Se eliminan los buffers y el segundo EWMA de JavaScript; el polling continua
+cada 2 s y se mantienen las escalas y el diseno. Es normal que dos consultas
+consecutivas reciban la misma muestra porque el polling es mas frecuente que
+la lectura del sensor.
+
+El historial conserva el promedio de muestras validas por minuto (unas 24
+en condiciones normales), los 60 puntos circulares y el CSV cada 5 minutos
+calculado como promedio de los promedios por minuto. Se divide por el numero
+real de muestras, sin asumir seis muestras por minuto ni multiplicar valores.
+Las ventanas siguen cerrandose al llegar una lectura valida; un fallo del sensor
+o una pausa del loop puede retrasarlas. Se conserva ese comportamiento previo.
+
+La alerta conserva el umbral de 35 C y el intervalo de 5 minutos. Puede dispararse
+antes: desde un valor filtrado de 30 C, una nueva lectura corregida de 40 C da
+35 C con alpha 0,5 (antes daba 32 C). Tambien se atenúan menos las fluctuaciones
+y pueden alcanzarse antes los extremos o el umbral por cambios breves.
+
+Los 2500 ms superan el minimo de 2000 ms de la biblioteca, sin lecturas forzadas
+ni rafagas para recuperar muestras atrasadas. El sensor mantiene su propia
+inercia fisica y la biblioteca bloquea interrupciones brevemente al recibir la
+trama. La estabilidad y el ruido deben verificarse en la placa.
+
+HTTPS sigue siendo sincrono: `client.connect()`, `http.GET()` y la recepcion
+ocupan el loop. Los timeouts de E/S de 5 s y las otras fases pueden superar el
+intervalo del DHT; `delay(1)` cede CPU al sistema, pero no ejecuta de nuevo el
+loop del sketch. Por tanto, esta mejora no garantiza muestras cada 2,5 s durante
+una operacion externa. Se mantienen los diagnosticos de duracion existentes.
+
+Verificaciones del ajuste:
+
+- Compilacion correcta para NodeMCU con ESP8266 Core 3.1.2, ArduinoJson 6.21.6,
+  DHT 1.4.6 y WiFiManager 2.0.17, en una copia temporal con credenciales de ejemplo.
+  RAM estatica: 35.596 B; IRAM mas cache: 61.859 B; codigo en flash: 550.684 B.
+  Persisten advertencias previas sobre SPIFFS obsoleto, formatos de fecha,
+  comparaciones de signo y posibles valores meteorologicos sin inicializar.
+- 36 comprobaciones nuevas de las funciones C++ reales de DHT, filtrado,
+  historial y bloque de alertas, con sensor/reloj/CSV simulados: NaN, offsets,
+  limites de humedad, escalones, promedio con muestras faltantes, cinco minutos
+  de CSV, anillo de 60 puntos y una pausa simulada de 15 s.
+- 72 comprobaciones Wi-Fi, 234 casos meteorologicos y las 8 respuestas originales
+  del endpoint aprobadas. La prueba de preservacion admite solo los cambios
+  DHT solicitados y mantiene sus comparaciones del resto del firmware.
+- Prueba en navegador aprobada con escalones de temperatura y humedad que
+  llegan directamente a ambas curvas, historicos intactos, polling de 2 s,
+  estados meteorologicos, cuatro graficos, CSV y cinco anchos de pantalla.
+
+Para repetir la prueba DHT con un compilador de escritorio (en Windows, `cl`
+desde una consola de desarrollo MSVC; en otros entornos, `g++`):
+
+```text
+python tests/dht_history_test.py --compiler cl --output <directorio-temporal>
+```
+
+Antes de validar en hardware: cargar manualmente conservando SPIFFS y la
+configuracion Wi-Fi, observar un cambio ambiental, contrastar tarjetas y curvas,
+comprobar un promedio por minuto y un CSV a los cinco minutos, y comparar la
+cadencia del DHT mientras Telegram/WeatherAPI realizan operaciones HTTPS.
+Esta etapa no incluye carga automatica ni nuevas pruebas fisicas.
+
+## Diagnostico temporal de HTTP y cadencia DHT (19/10/2026)
+
+Observacion comunicada desde hardware: el DHT aparece cada 2-3 s sin la pagina
+abierta y cada 6-7 s con ella abierta; navegador y Monitor Serie reflejan los
+cambios casi simultaneamente. El archivo contiene mas de 5000 registros.
+Estos datos son anteriores a las sondas de esta etapa; todavia no identifican
+por si solos la operacion responsable.
+
+La inspeccion confirma que `/csvinfo`, solicitado cada 5 s, llama siempre a
+`obtenerFechasCSV()`. Esta funcion abre el CSV y recorre todas sus lineas para
+obtener las fechas extremas. No carga el archivo entero a la vez, pero realiza
+una lectura completa y crea/reutiliza Strings para las lineas y fechas.
+Mientras dura esa solicitud, el sketch no vuelve al bloque de lectura DHT.
+`/data` se solicita cada 2 s: no recorre SPIFFS, pero calcula las fechas lunares
+y envia numerosos fragmentos mediante `WiFiClient::print`, incluidos hasta
+60 puntos de temperatura y 60 de humedad. `/csv` recorre tambien el archivo
+para construir su nombre y despues lo transmite en bloques de 512 bytes.
+
+El servidor es sincrono. Espera hasta 500 ms por datos iniciales; posteriormente
+`readStringUntil` puede esperar por el delimitador y las escrituras TCP pueden
+esperar por espacio o por la red. El timeout inicial no limita la solicitud
+completa. Los `yield`/`delay` internos atienden al sistema, no ejecutan otra vez
+el bloque DHT del sketch. Una solicitud pendiente puede acumularse con las
+siguientes porque el navegador conserva ambos intervalos de polling.
+Las operaciones HTTPS siguen siendo otra fuente de pausas, ya instrumentada
+por los diagnosticos previos. No se modifica ninguno de estos mecanismos.
+
+### Registros nuevos
+
+Las sondas estan aisladas en `ESP8266_DHT22/http_timing_diagnostics.h`.
+`DIAGNOSTICO_HTTP_TIEMPOS` vale 1 por defecto; definirlo a 0 antes de incluir
+el encabezado o como opcion de compilacion elimina las sondas. No cambia el
+diagnostico Wi-Fi/TLS existente. Cada linea empieza con `[PERF +<millis> ms]`.
+
+| Registro/campo | Significado |
+|---|---|
+| `DHT_INTENTO intervalo_ms` | Tiempo real entre entradas al bloque de lectura, incluidas las que resulten NaN. La primera indica `primero=1 intervalo_ms=0`. |
+| `HTTP ruta=... inicio_ms total_ms` | Una linea al terminar cada solicitud, desde que `server.available()` devuelve un cliente hasta despues de `stop()`. |
+| `espera_ms` | Espera inicial por datos; `sin_ruta` identifica una salida antes de reconocer la ruta. |
+| `recepcion_ms` | Lectura de la linea de solicitud y las cabeceras. |
+| `preparacion_ms` | Despacho y preparacion anteriores al primer envio; incluye el recorrido CSV en `/csvinfo`. |
+| `respuesta_ms` | Generacion y escrituras de la respuesta; no es una medicion exclusiva del tiempo de red. En `/csv` incluye el recorrido para el nombre y la lectura para transmitir. |
+| `cierre_ms` | Cierre del cliente y salida de la rama. |
+| `lunas_ms` | Submedicion de `calcularLunas()` en `/data`, ya incluida en `respuesta_ms`; no sumarla nuevamente. |
+| `CSV_FECHAS duracion_ms` | Duracion completa de `obtenerFechasCSV()`, incluyendo apertura y cierre. |
+| `CSV_NOMBRE duracion_ms` | Duracion de `obtenerNombreCSV()` durante una descarga. |
+| `abierto bytes_archivo lineas` | Apertura exitosa, tamano y numero de lineas recorridas, incluida la cabecera. |
+
+Las cinco fases HTTP suman `total_ms`. Las mediciones CSV estan incluidas en
+la fase HTTP correspondiente, no son tiempos adicionales. No se mide el tiempo
+en cola anterior a `server.available()` ni la latencia completa del navegador.
+Los contadores usan restas sin signo para tolerar el desbordamiento de millis().
+
+No se registran cabeceras, parametros de URL, contenido CSV ni credenciales;
+las etiquetas de ruta son constantes. Se emite una linea por solicitud, una
+por recorrido y una por intento DHT, nunca una por iteracion del loop o por
+registro CSV. El recorrido solo agrega un contador y una consulta de tamano.
+Las sondas no crean Strings ni buffers proporcionales al historial.
+
+La instrumentacion tiene un costo: Serial a 115200 baudios tarda aproximadamente
+17 ms en transmitir 200 caracteres (8N1), aunque el bloqueo efectivo depende
+del buffer. Cada temporizador captura su final antes de imprimir su propio
+resumen; el total HTTP si incluye la impresion del resumen CSV interno.
+El intervalo DHT incluye todas las pausas, tambien las de diagnostico. Por eso
+no debe interpretarse esta version como una medicion sin perturbacion.
+
+### Prueba fisica pendiente
+
+1. Cargar manualmente el firmware conservando SPIFFS y la configuracion Wi-Fi.
+   Capturar el Monitor Serie a 115200 baudios con la pagina cerrada durante
+   al menos un minuto, una vez completadas las comunicaciones iniciales.
+2. Abrir una sola pestana y registrar dos minutos sin descargar ni borrar CSV.
+   Cerrar la pagina y registrar otro minuto. Mantener el mismo historial.
+3. Buscar los `DHT_INTENTO` de 6000-7000 ms y las operaciones que ocurrieron
+   entre ambos intentos. Comparar `HTTP /data` y `HTTP /csvinfo`, sus fases,
+   `CSV_FECHAS` y los diagnosticos HTTPS existentes.
+4. Si domina `CSV_FECHAS` y coincide con `preparacion_ms` de `/csvinfo`, queda
+   localizado el costo del recorrido. Si domina `respuesta_ms` de `/data` con
+   `lunas_ms` pequeno, investigar generacion/escrituras TCP; ese dato por si
+   solo no distingue cada escritura. Si domina `recepcion_ms` o `cierre_ms`,
+   investigar la recepcion de cabeceras o el cierre TCP respectivamente.
+5. Opcionalmente descargar una vez el CSV para medir `CSV_NOMBRE` y `/csv`;
+   no usar el boton de borrado. La descarga es un escenario distinto del
+   polling normal y debe identificarse separadamente.
+
+Optimizaciones posibles, NO implementadas: si el recorrido resulta dominante,
+mantener en RAM las dos fechas extremas, inicializarlas una vez y actualizarlas
+en los puntos existentes de escritura/rotacion/borrado. Si las escrituras TCP
+dominan, evaluar agrupar fragmentos en un buffer pequeno y acotado. Si domina
+la recepcion, revisar el reconocimiento del final de cabeceras y el limite
+total de espera. Elegir solamente la correccion que justifiquen las mediciones;
+no modificar intervalos, graficas ni mecanismos de conexion como parte de este
+diagnostico.
+
+### Verificacion automatizada de las sondas
+
+`tests/http_timing_test.py` compila el encabezado real y los cuerpos reales de
+`obtenerFechasCSV`, `obtenerNombreCSV` y `/csvinfo`, con SPIFFS/Serial/reloj/cliente
+simulados. Se ejecuta con las sondas activadas y desactivadas. Verifica 5001
+registros mas cabecera, respuesta HTTP exacta, un unico cierre, fechas, nombre,
+archivo ausente, fallo de apertura, solo cabecera, intervalos DHT y rollover.
+Los tiempos sinteticos de esa prueba verifican la contabilidad de las fases;
+NO representan el rendimiento de SPIFFS ni TCP en el ESP8266.
+
+```text
+python tests/http_timing_test.py --compiler cl --output <directorio-temporal>
+```
+
+Se mantienen las 36 comprobaciones DHT/historial/alertas, 72 Wi-Fi, 234 JSON
+meteorologico y 8 respuestas del endpoint. La prueba de navegador conserva
+curvas directas, polling de 2 s, historicos, CSV y cinco anchos de pantalla.
+La comparacion del firmware con la copia anterior al diagnostico es identica
+al retirar solamente las sondas y su include. Los tests existentes de
+preservacion y endpoint se adaptan para aceptar las sondas, sin cambiar sus
+respuestas esperadas. No se ejecutaron solicitudes a servicios con secretos,
+ni operaciones sobre el SPIFFS real.
+
+Compilacion NodeMCU con ESP8266 Core 3.1.2, ArduinoJson 6.21.6, DHT 1.4.6 y
+WiFiManager 2.0.17, en copia temporal con `secrets.example.h` como credenciales
+ficticias: correcta con diagnostico activo. RAM estatica 35.604 B, IRAM mas cache
+61.859 B y codigo en flash 552.036 B. Respecto de la compilacion anterior al
+diagnostico: +8 B de RAM estatica, +1352 B de flash y sin aumento de IRAM.
+La compilacion completa con `DIAGNOSTICO_HTTP_TIEMPOS=0` tambien pasa:
+35.596 B de RAM estatica, 61.859 B de IRAM mas cache y 550.684 B de flash,
+los mismos valores que antes de agregar las sondas.
+Estos numeros no miden el maximo de pila ni el heap durante una conexion real.
+Las sondas usan pequenos objetos automaticos y no solicitan memoria dinamica.
+Persisten las advertencias anteriores de SPIFFS obsoleto, formatos de fecha,
+comparaciones de signo y posibles valores meteorologicos sin inicializar.
+
+## Fechas de CSV en memoria (19/10/2026)
+
+Una prueba fisica posterior confirmo la causa de la cadencia DHT degradada:
+con el navegador cerrado, los intervalos fueron de 2501 ms; con el navegador
+abierto, de 6300 a 8000 ms. /data tardo unos 100-120 ms, mientras /csvinfo
+tardo unos 6300-6400 ms y obtenerFechasCSV() unos 6240-6312 ms. El historial
+tenia 5292 lineas y 153471 bytes. Esas mediciones corresponden al firmware
+anterior a la cache, no al resultado de esta correccion.
+
+El recorrido de iniciarLog() durante el arranque ya cuenta los registros;
+ahora captura tambien la primera y la ultima fecha en dos buffers de 11 bytes
+(diez caracteres y terminador). No se añade otra lectura completa. Cada
+escritura CSV que informa exito actualiza la ultima fecha y, si el historial
+estaba vacio, tambien la primera. Un fallo de apertura o escritura deja la
+cache y el contador sin cambios. Al reiniciar el archivo por limite o mediante
+el boton manual se limpian las fechas cuando se consigue borrar o truncar el
+archivo. Si ambas operaciones fallan, se conservan los datos y la cache.
+
+obtenerFechasCSV() solo copia esos buffers a las cadenas que /csvinfo ya
+utilizaba; la respuesta sigue teniendo exactamente first y last, incluidas
+cadenas vacias si no hay registros o no pudo leerse el archivo al arrancar.
+La descarga /csv mantiene su nombre, contenido y recorrido propios; no se
+modifican los datos existentes, ni el intervalo de almacenamiento ni el
+reinicio al alcanzar el limite. El resto del servidor y la pagina permanecen
+sin cambios. El diagnostico CSV_FECHAS sigue activo, ahora para medir el
+acceso a la cache; las fases HTTP y DHT_INTENTO siguen disponibles.
+
+La nueva prueba nativa tests/csv_date_cache_test.py compila las funciones
+reales del firmware con SPIFFS simulado: 5292 lineas preexistentes, un solo
+recorrido inicial, diez consultas sin lecturas, escritura correcta, fallos de
+apertura y escritura, limite, fallo de reinicio, borrado manual, archivo nuevo,
+solo cabecera, registro corto, errores al abrir/crear y descarga con nombre y
+contenido. tests/http_timing_test.py verifica ademas el JSON exacto de
+/csvinfo y las fases con el diagnostico activo e inactivo. Son pruebas
+simuladas; no sustituyen la comprobacion en hardware.
+
+Compilacion correcta para NodeMCU con ESP8266 Core 3.1.2, ArduinoJson 6.21.6,
+DHT 1.4.6 y WiFiManager 2.0.17, en copia temporal con credenciales ficticias.
+Con los diagnosticos activados usa 35.628 B de RAM estatica, 61.859 B de
+IRAM mas cache y 551.956 B de flash. Frente al firmware con diagnosticos y
+sin cache: +24 B de RAM estatica, sin cambio de IRAM y -80 B de flash. No se
+midio el pico de heap/pila ni el tiempo real de /csvinfo tras este cambio.
+Las advertencias previas del compilador siguen presentes.
+
+Antes de evaluar el resultado, cargar manualmente el firmware sin borrar
+SPIFFS. Comparar, con el mismo historial y una sola pestana, los nuevos
+HTTP ruta=/csvinfo preparacion_ms, CSV_FECHAS duracion_ms y los intervalos
+DHT_INTENTO. Verificar tambien las fechas mostradas al abrir la pagina, tras
+un nuevo registro de cinco minutos y tras un reinicio de la placa. Se espera
+que /csvinfo deje de aportar unos 6,3 s de bloqueo por lectura del archivo;
+la cadencia final del DHT aun requiere esa medicion fisica.

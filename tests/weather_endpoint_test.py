@@ -16,6 +16,10 @@ helper = "void imprimirClimaExterior(Print &output) {" + helper
 endpoint = source.split('  if (requestLine.indexOf("GET /data") >= 0) {\n', 1)[1].split("\n  // /csv", 1)[0]
 endpoint = endpoint.rsplit("\n  }", 1)[0]
 prefix = r'''
+#define PERF_HTTP_ROUTE(...) ((void)0)
+#define PERF_HTTP_PHASE(...) ((void)0)
+#define PERF_HTTP_MOON_BEGIN() ((void)0)
+#define PERF_HTTP_MOON_END() ((void)0)
 #include <cmath>
 #include <math.h>
 #include <ctime>

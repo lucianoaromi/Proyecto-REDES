@@ -13,11 +13,11 @@ const path = require('node:path');
     fs.mkdirSync(output, { recursive: true });
     const state = {
         weather: { valid: false, temp: null, hum: null, updated: null, stale: false },
-        offline: false, clears: 0, csvRequests: 0
+        temp: 26.8, hum: 52, offline: false, clears: 0, csvRequests: 0
     };
     const stamp = '18/10/2026 05:10:00';
     const payload = () => ({
-        temp: 26.8, hum: 52, tmin: 24.1, tmax: 28.4, hmin: 48, hmax: 60,
+        temp: state.temp, hum: state.hum, tmin: 24.1, tmax: 28.4, hmin: 48, hmax: 60,
         time: '18/10/2026 05:12:00', hcount: 3, histT: [26.2, 26.6, 26.8], histH: [51, 52, 52],
         moonIcon: '🌓', moonName: 'Cuarto creciente', nextNewMoon: '09/11/2026', nextFullMoon: '26/10/2026',
         weather: state.weather
@@ -85,6 +85,90 @@ const path = require('node:path');
         assert.equal(await page.evaluate(() => tempHourChart.data.datasets[0].data.length), 3);
         assert.ok(await page.evaluate(() => tempChart.data.datasets[0].data.length > 0));
 
+        // La ventana inicial distingue 0,1 y 0,5 C sin exagerar la curva.
+        const escalaInicial = await page.evaluate(() => ({
+            min: tempChart.options.scales.y.min,
+            max: tempChart.options.scales.y.max,
+            step: tempChart.options.scales.y.ticks.stepSize,
+            tension: tempChart.data.datasets[0].tension,
+            humTension: humChart.data.datasets[0].tension,
+            ticks: tempChart.scales.y.ticks.map(t => t.value),
+            pixelDelta01: Math.abs(tempChart.scales.y.getPixelForValue(26.8) -
+                tempChart.scales.y.getPixelForValue(26.7)),
+            pixelDelta05: Math.abs(tempChart.scales.y.getPixelForValue(26.8) -
+                tempChart.scales.y.getPixelForValue(26.3)),
+            chartHeight: tempChart.chartArea.bottom - tempChart.chartArea.top
+        }));
+        assert.equal(escalaInicial.max - escalaInicial.min, 3);
+        assert.equal(escalaInicial.step, 0.5);
+        assert.equal(escalaInicial.tension, 0);
+        assert.equal(escalaInicial.humTension, 0.4);
+        assert.ok(escalaInicial.ticks.slice(1).every((tick, i) =>
+            Math.abs(tick - escalaInicial.ticks[i] - 0.5) < 0.001));
+        assert.ok(escalaInicial.pixelDelta01 > escalaInicial.chartHeight * 0.025);
+        assert.ok(escalaInicial.pixelDelta01 < escalaInicial.chartHeight * 0.045);
+        assert.ok(escalaInicial.pixelDelta05 > escalaInicial.chartHeight * 0.15);
+        assert.ok(escalaInicial.pixelDelta05 < escalaInicial.chartHeight * 0.20);
+
+        for (const temp of [26.7, 26.2, 26.7]) {
+            state.temp = temp;
+            await page.evaluate(() => actualizarDatos());
+            await page.waitForFunction(value => tempChart.data.datasets[0].data.at(-1) === value, temp);
+            const escala = await page.evaluate(() => ({
+                min: tempChart.options.scales.y.min, max: tempChart.options.scales.y.max
+            }));
+            assert.deepEqual(escala, { min: escalaInicial.min, max: escalaInicial.max });
+            assert.equal(await page.locator('#temp').textContent(), temp.toFixed(1));
+        }
+
+        state.temp = 23.8;
+        await page.evaluate(() => actualizarDatos());
+        await page.waitForFunction(() => tempChart.data.datasets[0].data.at(-1) === 23.8);
+        const escalaAmpliada = await page.evaluate(() => ({
+            min: tempChart.options.scales.y.min, max: tempChart.options.scales.y.max
+        }));
+        assert.ok(escalaAmpliada.min < 23.8 && escalaAmpliada.max > 26.8);
+        for (const temp of [23.7, 23.8, 23.7]) {
+            state.temp = temp;
+            await page.evaluate(() => actualizarDatos());
+            await page.waitForFunction(value => tempChart.data.datasets[0].data.at(-1) === value, temp);
+            assert.deepEqual(await page.evaluate(() => ({
+                min: tempChart.options.scales.y.min, max: tempChart.options.scales.y.max
+            })), escalaAmpliada);
+        }
+
+        state.temp = 30.8;
+        await page.evaluate(() => actualizarDatos());
+        await page.waitForFunction(() => tempChart.data.datasets[0].data.at(-1) === 30.8);
+        assert.ok(await page.evaluate(() => {
+            const values = tempChart.data.datasets[0].data;
+            const y = tempChart.options.scales.y;
+            return y.max - y.min >= 3 && Math.min(...values) > y.min &&
+                Math.max(...values) < y.max && values.at(-1) === 30.8;
+        }));
+        await page.evaluate(() => {
+            tempChart.data.labels = Array(40).fill('muestra estable');
+            tempChart.data.datasets[0].data = Array(40).fill(26.8);
+            actualizarEscalaTemperatura();
+            tempChart.update();
+        });
+        assert.equal(await page.evaluate(() =>
+            tempChart.options.scales.y.max - tempChart.options.scales.y.min), 3);
+
+        // Un escalon de /data debe llegar sin otro filtro a ambas curvas.
+        for (const [temp, hum] of [[34.8, 80], [20.8, 35], [26.8, 52]]) {
+            state.temp = temp; state.hum = hum;
+            await page.evaluate(() => actualizarDatos());
+            await page.waitForFunction(([t, h]) =>
+                tempChart.data.datasets[0].data.at(-1) === t &&
+                humChart.data.datasets[0].data.at(-1) === h, [temp, hum]);
+            assert.equal(await page.locator('#temp').textContent(), temp.toFixed(1));
+            assert.equal(await page.locator('#hum').textContent(), hum.toFixed(0));
+        }
+        assert.deepEqual(await page.evaluate(() => tempHourChart.data.datasets[0].data.map(p => p.y)), [26.2, 26.6, 26.8]);
+        assert.deepEqual(await page.evaluate(() => humHourChart.data.datasets[0].data.map(p => p.y)), [51, 52, 52]);
+        assert.match(html, /setInterval\(actualizarDatos, 2000\)/);
+
         const layouts = [];
         for (const width of [1280, 768, 680, 390, 320]) {
             await page.setViewportSize({ width, height: 900 });
@@ -129,7 +213,7 @@ const path = require('node:path');
         assert.deepEqual(errors, []);
         assert.equal(requests.filter(url => /api\.(weatherapi|telegram)\./.test(url)).length, 0);
         fs.writeFileSync(path.join(output, 'layout-results.json'), JSON.stringify(layouts, null, 2));
-        console.log('PASS: estados sin datos/validos/anteriores/offline, hora meteorologica fija, luna, 4 graficos, CSV y 5 anchos sin overflow.');
+        console.log('PASS: escalones sin EWMA, historicos y polling 2 s; estados meteorologicos, luna, 4 graficos, CSV y 5 anchos sin overflow.');
         console.log('Capturas y resultados:', output);
     } finally {
         if (browser) await browser.close();
