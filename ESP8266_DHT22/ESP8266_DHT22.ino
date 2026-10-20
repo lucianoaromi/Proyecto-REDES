@@ -24,14 +24,16 @@
 #include "weather_json.h"
 #include "wifi_provisioning.h"
 #include "http_timing_diagnostics.h"
+#include "led_api_control.h"
 
 // Diagnostico temporal: cambiar a 0 para compilar sin trazas de conexion.
 #define DIAGNOSTICO_CONEXIONES 1
 
 // =============================
-// Brillo del LED de lluvia (0 = apagado, 1023 = máximo)
+// Brillo del LED de lluvia (Core 3.1.2: 0 = apagado, 255 = máximo)
 // =============================
 const uint16_t BRILLO_LLUVIA = 15; 
+const uint16_t BRILLO_LLUVIA_MANUAL = 64; // Core 3.1.2: PWM 0..255 (~25%).
 
 
 // =============================
@@ -126,6 +128,9 @@ uint16_t csvCount = 0;
 // =============================
 const uint8_t LED_API  = D6;  // LED temp API
 const uint8_t LED_RAIN = D7;  // LED lluvia API
+void cambiarControlLluvia(bool manual, bool on);
+bool estadoLedLluvia();
+LedApiControl ledApi(LED_API, cambiarControlLluvia, estadoLedLluvia);
 
 float tempApi   = NAN;   // última temperatura desde la API
 float humApi    = NAN;
@@ -637,11 +642,13 @@ String faseIcono(int f) {
 // Ticker callbacks para patrón de lluvia
 // -----------------------------
 void IRAM_ATTR toggleRainLed() {
+  if (ledApi.manual() || !rainWindowActive) return;
   rainLedState = !rainLedState;
   analogWrite(LED_RAIN, rainLedState ? BRILLO_LLUVIA : 0);
 }
 
 void stopRainWindow() {
+  if (ledApi.manual()) return;
   rainWindowActive = false;
   rainLedState = false;
   rainBlinkTicker.detach();
@@ -649,6 +656,7 @@ void stopRainWindow() {
 }
 
 void startRainWindow() {
+  if (ledApi.manual() || !rainPatternEnabled) return;
   rainWindowActive = true;
   rainLedState = false;
   analogWrite(LED_RAIN, 0);
@@ -662,6 +670,7 @@ void startRainWindow() {
 }
 
 void disableRainPattern() {
+  if (ledApi.manual()) return;
   rainPatternEnabled = false;
   rainBurstTicker.detach();
   rainWindowEndTicker.detach();
@@ -670,6 +679,7 @@ void disableRainPattern() {
 }
 
 void enableRainPattern() {
+  if (ledApi.manual()) return;
   rainPatternEnabled = true;
   startRainWindow();            // arranca inmediatamente la primera ráfaga
   rainBurstTicker.detach();
@@ -678,8 +688,10 @@ void enableRainPattern() {
 
 // Controla el patrón según lluvia actual / pronóstico / modo prueba
 void actualizarPatronLluvia() {
+  if (ledApi.manual()) return;
   if (MODO_PRUEBA_LLUVIA) {
     disableRainPattern();
+    rainLedState = true;
     analogWrite(LED_RAIN, BRILLO_LLUVIA);
     return;
   }
@@ -687,6 +699,7 @@ void actualizarPatronLluvia() {
   // Lluvia actual: LED fijo encendido, sin parpadeo
   if (lluviaApi) {
     disableRainPattern();
+    rainLedState = true;
     analogWrite(LED_RAIN, BRILLO_LLUVIA);
     return;
   }
@@ -706,6 +719,26 @@ void actualizarPatronLluvia() {
 // Mantener compatibilidad con llamadas existentes
 void actualizarLedRain(unsigned long /*ahora*/) {
   actualizarPatronLluvia();
+}
+
+// Transiciones llamadas desde loop(), sin espera ni escritura en flash.
+void cambiarControlLluvia(bool manual, bool on) {
+  rainBurstTicker.detach();
+  rainWindowEndTicker.detach();
+  rainBlinkTicker.detach();
+  rainPatternEnabled = false;
+  rainWindowActive = false;
+  rainLedState = false;
+  if (manual) {
+    rainLedState = on;
+    analogWrite(LED_RAIN, on ? BRILLO_LLUVIA_MANUAL : 0);
+  } else {
+    actualizarPatronLluvia();
+  }
+}
+
+bool estadoLedLluvia() {
+  return rainLedState;
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -818,15 +851,7 @@ bool actualizarClimaApi() {
   actualizarPatronLluvia();
 
   // --------- LED DE TEMPERATURA ----------
-  const float UMBRAL_LED = 35.0;  // umbral temp API
-
-  if (!isnan(tempApi) && tempApi >= UMBRAL_LED) {
-    digitalWrite(LED_API, HIGH);
-    Serial.println("[API] LED_API ON (temp_api >= umbral)");
-  } else {
-    digitalWrite(LED_API, LOW);
-    Serial.println("[API] LED_API OFF (temp_api < umbral o dato inválido)");
-  }
+  ledApi.weather(tempApi);
   DIAG_ESTADO(ServicioDiag::WeatherAPI, EstadoDiag::Exito,
               F("EXITO"), F("HTTP 200 y JSON valido"));
   return true;
@@ -1003,10 +1028,8 @@ void setup() {
   dht.begin();
 
   pinMode(LED_API, OUTPUT);
-  digitalWrite(LED_API, LOW);
-
   pinMode(LED_RAIN, OUTPUT);   // NUEVO
-  analogWrite(LED_RAIN, 0); // NUEVO
+  ledApi.begin();
 
   DIAG_ESTADO(ServicioDiag::Telegram, EstadoDiag::Pendiente,
               F("PENDIENTE"), F("aviso de inicio"));
@@ -1178,6 +1201,14 @@ void loop() {
   }
 
   PERF_HTTP_PHASE(Preparacion);
+  // LED_CONTROL_BEGIN
+  if (ledApi.handleRequest(requestLine.c_str(), client)) {
+    PERF_HTTP_ROUTE(F("/led"));
+    PERF_HTTP_PHASE(Cierre);
+    client.stop();
+    return;
+  }
+  // LED_CONTROL_END
   // /data
   if (requestLine.indexOf("GET /data") >= 0) {
     PERF_HTTP_ROUTE(F("/data"));
@@ -1241,6 +1272,10 @@ void loop() {
     }
     client.print("]");
     imprimirClimaExterior(client);
+    // LED_CONTROL_BEGIN
+    client.print(",\"led\":");
+    ledApi.printState(client);
+    // LED_CONTROL_END
     client.println("}");
 
     PERF_HTTP_PHASE(Cierre);
@@ -1678,7 +1713,6 @@ void loop() {
             margin: 0;
             padding: 22px;
             border: 1px solid rgba(255,255,255,0.06);
-            transition: transform 0.25s, box-shadow 0.25s;
         }
 
         .card-heading, .card-title-group {
@@ -1687,6 +1721,28 @@ void loop() {
             gap: 12px;
         }
 
+        /* LED_CONTROL_BEGIN */
+        .card-heading.local-heading { align-items: flex-start; flex-wrap: nowrap; gap: 8px; }
+        .led-control { margin-left: auto; text-align: right; font-size: 11px; color: #AAA; }
+        .led-switch { display: flex; align-items: center; gap: 6px; margin-left: auto;
+            background: none; border: 0; padding: 6px 0; min-height: 44px; color: #EEE; cursor: pointer; font: inherit; }
+        .led-track { width: 34px; height: 20px; border-radius: 12px; background: #555; padding: 3px; }
+        .led-track::after { content: ''; display: block; width: 14px; height: 14px;
+            background: #FFF; border-radius: 50%; }
+        .led-switch[aria-checked="true"] .led-track { background: #16A085; }
+        .led-switch[aria-checked="true"] .led-track::after { transform: translateX(14px); }
+        .led-switch:disabled { opacity: .55; cursor: wait; }
+        .led-auto { display: block; margin: 3px 0 0 auto; background: none; border: 0;
+            padding: 4px 0; color: #82CFC0; text-decoration: underline; font: inherit; cursor: pointer; }
+        .led-auto:disabled { color: #999; text-decoration: none; cursor: default; }
+        #ledError { display: block; max-width: 140px; color: #FFB4A9; }
+        @media (max-width: 400px) {
+            .local-heading .card-title-group { gap: 6px; }
+            .local-heading h2 { font-size: 16px; }
+            .local-heading .card-symbol { font-size: 24px; }
+            .led-control { max-width: 100px; flex-shrink: 0; }
+        }
+        /* LED_CONTROL_END */
         .card-heading { justify-content: space-between; margin-bottom: 25px; }
         .card-title-group { min-width: 0; }
         .card-symbol { color: #ff8b5d; font-size: 30px; }
@@ -1734,10 +1790,6 @@ void loop() {
         .lunar-event { display: flex; flex-direction: column; gap: 8px; padding-left: 22px; border-left: 1px solid rgba(255,255,255,0.08); }
         .lunar-event .label-ios { font-size: 12px; }
         .lunar-event .value-ios { font-size: 17px; font-weight: 600; }
-
-        @media (hover: hover) {
-            .environment-card:hover { transform: translateY(-2px); box-shadow: 0 8px 22px rgba(0,0,0,0.15); }
-        }
 
         @media (max-width: 680px) {
             body { padding: 18px 16px; }
@@ -1912,7 +1964,7 @@ void loop() {
     <main class="monitoring-layout">
     <section class="environment-grid" aria-label="Monitoreo ambiental">
         <article class="panel environment-card" aria-labelledby="localTitle">
-            <header class="card-heading">
+            <header class="card-heading local-heading">
                 <div class="card-title-group">
                     <span class="material-symbols-rounded card-symbol" aria-hidden="true">sensors</span>
                     <div>
@@ -1920,6 +1972,17 @@ void loop() {
                         <p class="card-subtitle">DHT22 · ESP8266</p>
                     </div>
                 </div>
+                <!-- LED_CONTROL_BEGIN -->
+                <div class="led-control">
+                    <button id="ledSwitch" class="led-switch" type="button" role="switch"
+                            aria-checked="false" aria-label="LEDs D6/D7" disabled>
+                        <span class="led-track" aria-hidden="true"></span><span>LEDs D6/D7</span>
+                    </button>
+                    <span id="ledStatus" role="status" aria-live="polite">Sin confirmar</span>
+                    <button id="ledAuto" class="led-auto" type="button" disabled>Automático</button>
+                    <span id="ledError" role="alert"></span>
+                </div>
+                <!-- LED_CONTROL_END -->
             </header>
             <div class="metric-grid">
                 <div>
@@ -2231,7 +2294,69 @@ void loop() {
             status.dataset.state = !valid ? 'empty' : (weather.stale ? 'stale' : 'current');
         }
 
+        // LED_CONTROL_BEGIN
+        let ledConfirmed = null;
+        let ledPending = false;
+        let ledGeneration = 0;
+
+        function mostrarLed(state) {
+            if (!state || !['auto', 'manual'].includes(state.mode) || typeof state.on !== 'boolean' ||
+                typeof state.d6 !== 'boolean' || typeof state.d7 !== 'boolean' ||
+                state.on !== (state.d6 && state.d7) ||
+                (state.mode === 'manual' && state.d6 !== state.d7)) {
+                throw new Error('Estado LED inválido');
+            }
+            ledConfirmed = state;
+            document.getElementById('ledSwitch').setAttribute('aria-checked', String(state.on));
+            document.getElementById('ledStatus').textContent =
+                state.mode === 'auto' ? 'Automático' : `Manual · ${state.on ? 'ON' : 'OFF'}`;
+            document.getElementById('ledSwitch').title =
+                `D6 ${state.d6 ? 'ON' : 'OFF'} · D7 ${state.d7 ? 'ON' : 'OFF'}`;
+            document.getElementById('ledSwitch').disabled = ledPending;
+            document.getElementById('ledAuto').disabled = ledPending || state.mode === 'auto';
+        }
+
+        function errorLed() {
+            document.getElementById('ledError').textContent = 'Sin confirmación. Reintentá.';
+            document.getElementById('ledSwitch').disabled = true;
+            document.getElementById('ledAuto').disabled = true;
+        }
+
+        async function cambiarLed(auto = false) {
+            if (ledPending || !ledConfirmed) return;
+            ledPending = true;
+            ++ledGeneration;
+            mostrarLed(ledConfirmed);
+            document.getElementById('ledError').textContent = '';
+            document.getElementById('ledStatus').textContent = 'Confirmando…';
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), 8000);
+            try {
+                const query = auto ? 'mode=auto' : `mode=manual&on=${ledConfirmed.on ? 0 : 1}`;
+                const response = await fetch(`/led?${query}`, {
+                    method: 'PUT', cache: 'no-store', signal: controller.signal
+                });
+                if (!response.ok) throw new Error('Error HTTP');
+                const state = await response.json();
+                // Validar antes de habilitar controles o sustituir el ultimo estado confirmado.
+                mostrarLed(state);
+                ledPending = false;
+                mostrarLed(state);
+            } catch (error) {
+                ledPending = false;
+                mostrarLed(ledConfirmed);
+                errorLed();
+            } finally {
+                clearTimeout(timeout);
+                ++ledGeneration; // Descarta consultas /data iniciadas durante el comando.
+            }
+        }
+        // LED_CONTROL_END
+
         function actualizarDatos() {
+            // LED_CONTROL_BEGIN
+            const ledVersion = ledGeneration;
+            // LED_CONTROL_END
             fetch('/data')
                 .then(r => r.json())
                 .then(d => {
@@ -2243,6 +2368,14 @@ void loop() {
                     document.getElementById('hmax').textContent = d.hmax.toFixed(0);
                     document.getElementById('time').textContent = d.time;
                     actualizarClimaExterior(d.weather);
+                    // LED_CONTROL_BEGIN
+                    if (!ledPending && ledVersion === ledGeneration) {
+                        try {
+                            mostrarLed(d.led);
+                            document.getElementById('ledError').textContent = '';
+                        } catch (error) { errorLed(); }
+                    }
+                    // LED_CONTROL_END
 
                     document.getElementById('moonIcon').textContent = d.moonIcon;
                     document.getElementById('moonName').textContent = d.moonName;
@@ -2288,10 +2421,17 @@ void loop() {
                 .catch(err => {
                     console.error('Error al obtener /data', err);
                     actualizarClimaExterior(null, true);
+                    // LED_CONTROL_BEGIN
+                    if (!ledPending && ledVersion === ledGeneration) errorLed();
+                    // LED_CONTROL_END
                 });
         }
 
         window.addEventListener('load', () => {
+            // LED_CONTROL_BEGIN
+            document.getElementById('ledSwitch').addEventListener('click', () => cambiarLed());
+            document.getElementById('ledAuto').addEventListener('click', () => cambiarLed(true));
+            // LED_CONTROL_END
             crearGraficos();
             actualizarDatos();
             setInterval(actualizarDatos, 2000);

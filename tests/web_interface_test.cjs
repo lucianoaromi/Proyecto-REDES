@@ -11,19 +11,31 @@ const path = require('node:path');
     const html = source.match(/R"rawliteral\(([\s\S]*?)\)rawliteral"/)[1];
     const output = process.env.WEB_TEST_OUTPUT || path.join(require('node:os').tmpdir(), 'redes-web-test');
     fs.mkdirSync(output, { recursive: true });
+    const ledState = (mode, d6, d7 = d6) => ({ mode, on: d6 && d7, d6, d7 });
     const state = {
         weather: { valid: false, temp: null, hum: null, updated: null, stale: false },
-        temp: 26.8, hum: 52, offline: false, clears: 0, csvRequests: 0
+        temp: 26.8, hum: 52, offline: false, clears: 0, csvRequests: 0,
+        led: ledState('auto', false), ledFailure: false
     };
     const stamp = '18/10/2026 05:10:00';
     const payload = () => ({
         temp: state.temp, hum: state.hum, tmin: 24.1, tmax: 28.4, hmin: 48, hmax: 60,
         time: '18/10/2026 05:12:00', hcount: 3, histT: [26.2, 26.6, 26.8], histH: [51, 52, 52],
         moonIcon: '🌓', moonName: 'Cuarto creciente', nextNewMoon: '09/11/2026', nextFullMoon: '26/10/2026',
-        weather: state.weather
+        weather: state.weather, led: state.led
     });
     const server = http.createServer((req, res) => {
         if (req.url === '/') { res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' }); return res.end(html); }
+        if (req.url.startsWith('/led?')) {
+            assert.equal(req.method, 'PUT');
+            if (state.ledFailure) { res.writeHead(503); return res.end('unavailable'); }
+            const query = new URL(req.url, 'http://localhost').searchParams;
+            state.led = query.get('mode') === 'auto' ?
+                ledState('auto', state.weather.valid && state.weather.temp >= 35, false) :
+                ledState('manual', query.get('on') === '1');
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            return res.end(JSON.stringify(state.led));
+        }
         if (req.url === '/data') {
             res.writeHead(state.offline ? 503 : 200, { 'Content-Type': 'application/json' });
             return res.end(state.offline ? 'unavailable' : JSON.stringify(payload()));
@@ -53,6 +65,98 @@ const path = require('node:path');
         await page.evaluate(() => document.fonts.ready);
         assert.equal(await page.locator('#weatherTemp').textContent(), '--');
         assert.equal(await page.locator('#weatherUpdated').textContent(), 'Sin datos');
+        assert.equal(await page.locator('#ledSwitch').getAttribute('aria-label'), 'LEDs D6/D7');
+
+        // El switch espera al ESP; no cambia optimistamente ni ante HTTP fallido.
+        assert.equal(await page.locator('#ledSwitch').getAttribute('aria-checked'), 'false');
+        await page.locator('#ledSwitch').click();
+        await page.waitForFunction(() => document.getElementById('ledStatus').textContent === 'Manual · ON');
+        assert.deepEqual(state.led, ledState('manual', true));
+        await page.locator('#ledSwitch').click();
+        await page.waitForFunction(() => document.getElementById('ledStatus').textContent === 'Manual · OFF');
+        state.ledFailure = true;
+        await page.locator('#ledSwitch').click();
+        await page.waitForFunction(() => document.getElementById('ledError').textContent.includes('Sin confirmación'));
+        assert.equal(await page.locator('#ledSwitch').getAttribute('aria-checked'), 'false');
+        assert.deepEqual(state.led, ledState('manual', false));
+        state.ledFailure = false;
+        await page.evaluate(() => actualizarDatos());
+        await page.waitForFunction(() => !document.getElementById('ledSwitch').disabled);
+        await page.locator('#ledAuto').click();
+        await page.waitForFunction(() => document.getElementById('ledStatus').textContent === 'Automático');
+        // En automatico cada salida es independiente; no afirmar que ambas estan ON.
+        state.led = ledState('auto', true, false);
+        await page.evaluate(() => actualizarDatos());
+        await page.waitForFunction(() => document.getElementById('ledSwitch').title === 'D6 ON · D7 OFF');
+        assert.equal(await page.locator('#ledSwitch').getAttribute('aria-checked'), 'false');
+        state.led = ledState('auto', false, true);
+        await page.evaluate(() => actualizarDatos());
+        await page.waitForFunction(() => document.getElementById('ledSwitch').title === 'D6 OFF · D7 ON');
+        // Segundo navegador real: envia la orden y el primero recibe /data.
+        const peer = await context.newPage();
+        await peer.goto(`http://127.0.0.1:${server.address().port}`, { waitUntil: 'load' });
+        await peer.waitForFunction(() => !document.getElementById('ledSwitch').disabled);
+        await peer.locator('#ledSwitch').click();
+        await peer.waitForFunction(() => document.getElementById('ledStatus').textContent === 'Manual · ON');
+        await page.evaluate(() => actualizarDatos());
+        await page.waitForFunction(() => document.getElementById('ledStatus').textContent === 'Manual · ON');
+        assert.equal(await peer.locator('#ledSwitch').getAttribute('aria-checked'), 'true');
+        await peer.close();
+
+        // Respuesta demorada: conserva ON hasta recibir confirmacion de OFF.
+        let release;
+        let started;
+        const requested = new Promise(resolve => { started = resolve; });
+        const held = new Promise(resolve => { release = resolve; });
+        await page.route('**/led?*', async route => {
+            started(); await held;
+            state.led = ledState('manual', false);
+            await route.fulfill({ json: state.led });
+        });
+        await page.locator('#ledSwitch').click();
+        await requested;
+        assert.equal(await page.locator('#ledSwitch').getAttribute('aria-checked'), 'true');
+        assert.ok(await page.locator('#ledSwitch').isDisabled());
+        await page.evaluate(() => actualizarDatos());
+        release();
+        await page.waitForFunction(() => document.getElementById('ledStatus').textContent === 'Manual · OFF');
+        await page.unroute('**/led?*');
+        await page.route('**/led?*', route => route.abort());
+        await page.locator('#ledSwitch').click();
+        await page.waitForFunction(() => document.getElementById('ledError').textContent.includes('Sin confirmación'));
+        assert.equal(await page.locator('#ledSwitch').getAttribute('aria-checked'), 'false');
+        await page.unroute('**/led?*');
+        await page.evaluate(() => actualizarDatos());
+        await page.waitForFunction(() => !document.getElementById('ledSwitch').disabled);
+
+        // Una respuesta /data anterior al comando no puede revertir su confirmacion.
+        let releaseData;
+        let dataStarted;
+        const dataRequested = new Promise(resolve => { dataStarted = resolve; });
+        const dataHeld = new Promise(resolve => { releaseData = resolve; });
+        const oldPayload = JSON.stringify(payload());
+        await page.route('**/data', async route => {
+            dataStarted(); await dataHeld;
+            await route.fulfill({ contentType: 'application/json', body: oldPayload });
+        }, { times: 1 });
+        await page.evaluate(() => actualizarDatos());
+        await dataRequested;
+        await page.locator('#ledSwitch').click();
+        await page.waitForFunction(() => document.getElementById('ledStatus').textContent === 'Manual · ON');
+        const oldResponse = page.waitForResponse(response => response.url().endsWith('/data'));
+        releaseData();
+        await oldResponse;
+        await page.waitForTimeout(100);
+        assert.equal(await page.locator('#ledSwitch').getAttribute('aria-checked'), 'true');
+
+        // HTTP 200 con JSON invalido tampoco confirma el cambio.
+        await page.route('**/led?*', route => route.fulfill({ json: { mode: 'manual' } }));
+        await page.locator('#ledSwitch').click();
+        await page.waitForFunction(() => document.getElementById('ledError').textContent.includes('Sin confirmación'));
+        assert.equal(await page.locator('#ledSwitch').getAttribute('aria-checked'), 'true');
+        await page.unroute('**/led?*');
+        await page.evaluate(() => actualizarDatos());
+        await page.waitForFunction(() => !document.getElementById('ledSwitch').disabled);
 
         state.weather = { valid: true, temp: 32.4, hum: 0, updated: stamp, stale: false };
         await page.evaluate(() => actualizarDatos());
@@ -170,6 +274,31 @@ const path = require('node:path');
         assert.match(html, /setInterval\(actualizarDatos, 2000\)/);
 
         const layouts = [];
+        await page.mouse.move(0, 0);
+        const cardBase = await page.locator('.environment-card').evaluateAll(cards => cards.map(card => {
+            const style = getComputedStyle(card);
+            return { transform: style.transform, transition: style.transition, shadow: style.boxShadow };
+        }));
+        for (const card of await page.locator('.environment-card').all()) {
+            await card.hover();
+            await page.waitForTimeout(50);
+            const cardHover = await page.locator('.environment-card').evaluateAll(cards => cards.map(card => {
+                const style = getComputedStyle(card);
+                return { transform: style.transform, shadow: style.boxShadow };
+            }));
+            assert.deepEqual(cardHover, cardBase.map(({ transform, shadow }) => ({ transform, shadow })));
+        }
+        assert.ok(cardBase.every(({ transition }) => !/transform|box-shadow/.test(transition)));
+        const clearBase = await page.locator('#btnClear').evaluate(button => ({
+            transform: getComputedStyle(button).transform, background: getComputedStyle(button).backgroundColor
+        }));
+        await page.locator('#btnClear').hover();
+        await page.waitForTimeout(250);
+        const clearHover = await page.locator('#btnClear').evaluate(button => ({
+            transform: getComputedStyle(button).transform, background: getComputedStyle(button).backgroundColor
+        }));
+        assert.notDeepEqual(clearHover, clearBase);
+        await page.mouse.move(0, 0);
         for (const width of [1280, 768, 680, 390, 320]) {
             await page.setViewportSize({ width, height: 900 });
             await page.waitForTimeout(300); // Permitir el resize de Chart.js y las fuentes.
@@ -185,6 +314,13 @@ const path = require('node:path');
                     clear: document.getElementById('btnClear').getBoundingClientRect().toJSON() };
             });
             assert.ok(layout.scroll <= width, `overflow horizontal a ${width}px`);
+            const ledLayout = await page.evaluate(() => {
+                const a = document.querySelector('.local-heading .card-title-group').getBoundingClientRect();
+                const b = document.querySelector('.led-control').getBoundingClientRect();
+                return { titleRight: a.right, controlLeft: b.left, topDelta: Math.abs(a.top - b.top) };
+            });
+            assert.ok(ledLayout.controlLeft >= ledLayout.titleRight, `LED solapado a ${width}px`);
+            assert.ok(ledLayout.topDelta < 2, `LED fuera del encabezado a ${width}px`);
             if (width > 680) {
                 assert.ok(Math.abs(layout.cards[0].top - layout.cards[1].top) < 1);
                 assert.ok(Math.abs(layout.cards[0].height - layout.cards[1].height) < 1);
@@ -213,10 +349,14 @@ const path = require('node:path');
         assert.deepEqual(errors, []);
         assert.equal(requests.filter(url => /api\.(weatherapi|telegram)\./.test(url)).length, 0);
         fs.writeFileSync(path.join(output, 'layout-results.json'), JSON.stringify(layouts, null, 2));
-        console.log('PASS: escalones sin EWMA, historicos y polling 2 s; estados meteorologicos, luna, 4 graficos, CSV y 5 anchos sin overflow.');
+        console.log('PASS: LED manual/auto, confirmaciones, errores HTTP/red y sincronizacion; escalones sin EWMA, historicos y polling 2 s; estados meteorologicos, luna, 4 graficos, CSV y 5 anchos sin overflow.');
         console.log('Capturas y resultados:', output);
     } finally {
         if (browser) await browser.close();
-        await new Promise(resolve => server.close(resolve));
+        await new Promise(resolve => {
+            server.close(resolve);
+            // Las pruebas de fallo de red pueden dejar sockets del fixture abiertos.
+            server.closeAllConnections();
+        });
     }
 })().catch(error => { console.error(error); process.exitCode = 1; });

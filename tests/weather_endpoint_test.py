@@ -28,6 +28,13 @@ prefix = r'''
 #include <iostream>
 #include <sstream>
 #include <string>
+#define HIGH 1
+#define LOW 0
+void digitalWrite(unsigned char, int) {}
+#include "led_api_control.h"
+void rainMode(bool, bool) {}
+bool rainState() { return false; }
+LedApiControl ledApi(12, rainMode, rainState);
 using String = std::string;
 struct Print {
   std::ostringstream text;
@@ -82,7 +89,13 @@ binary = args.output / ("endpoint_test.wasm" if args.wasi else "endpoint_test.ex
 command = [args.compiler]
 if args.wasi:
     command += ["c++", "-target", "wasm32-wasi", "-fno-exceptions", "-fno-rtti"]
-command += ["-std=c++11", "-Wall", "-Wextra", "-Werror", "-O1", str(cpp), "-o", str(binary)]
+include = str(Path(__file__).resolve().parents[1] / "ESP8266_DHT22")
+if Path(args.compiler).stem.lower() == "cl":
+    command += ["/nologo", "/std:c++17", "/EHsc", "/W4", "/WX", "/utf-8",
+                "/D_CRT_SECURE_NO_WARNINGS", "/I" + include,
+                "/Fo" + str(binary.with_suffix(".obj")), "/Fe" + str(binary), str(cpp)]
+else:
+    command += ["-I" + include, "-std=c++11", "-Wall", "-Wextra", "-Werror", "-O1", str(cpp), "-o", str(binary)]
 subprocess.run(command, check=True)
 if args.wasi:
     runner = args.output / "run_endpoint.cjs"
@@ -97,7 +110,8 @@ rows = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
 assert len(rows) == 8
 legacy = {"temp", "hum", "tmin", "tmax", "hmin", "hmax", "time", "hcount", "moonIcon", "moonName", "nextNewMoon", "nextFullMoon", "histT", "histH"}
 for row in rows:
-    assert set(row) == legacy | {"weather"}
+    assert set(row) == legacy | {"weather", "led"}
+    assert row["led"] == {"mode": "auto", "on": False, "d6": False, "d7": False}
     assert row["temp"] == 26.8 and row["hum"] == 52 and row["histT"] == [26.2, 26.6, 26.8]
     assert row["hcount"] == 3 and row["moonName"] == "Cuarto creciente"
 assert rows[0]["weather"] == {"valid": False, "temp": None, "hum": None, "updated": None, "stale": False}

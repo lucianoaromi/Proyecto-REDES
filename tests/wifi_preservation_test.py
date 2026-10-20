@@ -23,8 +23,37 @@ def function(source, name):
 
 path = "ESP8266_DHT22/ESP8266_DHT22.ino"
 before, after = original(path), (root/path).read_text(encoding="utf-8")
+assert "pinMode(LED_API, OUTPUT);" in after and "pinMode(LED_RAIN, OUTPUT);" in after
+assert after.index("pinMode(LED_RAIN, OUTPUT);") < after.index("ledApi.begin();")
+assert after.count("ledApi.weather(tempApi);") == 1
+assert "digitalWrite(LED_API" not in after
+assert 'ledApi.handleRequest(requestLine.c_str(), client)' in after
 # Las sondas temporales son sentencias independientes; comparar la logica sin ellas.
 after = re.sub(r"^[ \t]*PERF_[^\n]*\n", "", after, flags=re.M)
+# Las adiciones D6/D7 se ejecutan en las pruebas del controlador, lluvia e interfaz.
+# Comparar todo el resto del servidor y la interfaz con las mismas protecciones.
+after = re.sub(r"^[^\n]*LED_CONTROL_BEGIN[^\n]*\n[\s\S]*?^[^\n]*LED_CONTROL_END[^\n]*\n",
+               "", after, flags=re.M)
+after = after.replace('class="card-heading local-heading"', 'class="card-heading"')
+for addition in [
+    "LedApiControl ledApi(LED_API, cambiarControlLluvia, estadoLedLluvia);\n",
+    "void cambiarControlLluvia(bool manual, bool on);\n", "bool estadoLedLluvia();\n",
+    "const uint16_t BRILLO_LLUVIA_MANUAL = 64; // Core 3.1.2: PWM 0..255 (~25%).\n",
+]:
+    assert addition in after
+    after = after.replace(addition, "")
+for name in ["toggleRainLed", "stopRainWindow", "startRainWindow", "disableRainPattern",
+             "enableRainPattern", "actualizarPatronLluvia"]:
+    actual = function(after, name)
+    normalized = re.sub(r"^  if \(ledApi.manual\(\)[^\n]*\n", "", actual, flags=re.M)
+    normalized = normalized.replace("    rainLedState = true;\n", "")
+    assert normalized == function(before, name), name
+    after = after.replace(actual, normalized)
+old_led = function(before, "actualizarClimaApi").split(
+    "  // --------- LED DE TEMPERATURA ----------\n", 1)[1].split(
+    "  DIAG_ESTADO(ServicioDiag::WeatherAPI", 1)[0]
+assert "  ledApi.weather(tempApi);\n" in after
+after = after.replace("  ledApi.weather(tempApi);\n", old_led)
 def without_blank_lines(text):
     return "\n".join(line for line in text.splitlines() if line.strip())
 functions = ["horaValidaParaTLS", "configurarTLS", "enviarTelegram", "actualizarClimaApi",
@@ -42,6 +71,12 @@ for filename in ["weather_json.h", "tls_certificates.h"]:
 # leerDHT y sus consumidores se verifican ejecutando el C++ real en dht_history_test.py.
 anchor = "  WiFiClient client = server.available();"
 expected_server = before.split(anchor, 1)[1]
+# Retirada del hover de tarjetas autorizada en la etapa anterior.
+expected_server = expected_server.replace("            transition: transform 0.25s, box-shadow 0.25s;\n", "")
+expected_server = expected_server.replace(
+    "        @media (hover: hover) {\n"
+    "            .environment-card:hover { transform: translateY(-2px); box-shadow: 0 8px 22px rgba(0,0,0,0.15); }\n"
+    "        }\n", "")
 clear_begin, clear_end = "  // /clearcsv", "  // /csvinfo"
 def without_clear_endpoint(text):
     return text.split(clear_begin, 1)[0] + clear_begin + clear_end + text.split(clear_end, 1)[1]
@@ -79,4 +114,4 @@ assert "wifiProvisioning.begin(WIFI_CONFIG_AP_PASSWORD, ssid, password);" in aft
 assert "WiFi.begin(ssid, password)" not in after
 assert subprocess.check_output(["git", "ls-files", "--", "ESP8266_DHT22/secrets.h"], cwd=root) == b""
 subprocess.run(["git", "check-ignore", "-q", "ESP8266_DHT22/secrets.h"], cwd=root, check=True)
-print(f"PASS: {len(functions)} funciones originales, certificados, parser JSON y umbrales intactos; servidor/interfaz con cambios DHT, CSV y escala de temperatura autorizados; secrets.h ignorado.")
+print(f"PASS: {len(functions)} funciones comparadas salvo control D6/D7 autorizado; certificados, parser JSON y umbrales intactos; servidor/interfaz con cambios DHT, CSV, escala, tarjetas estaticas y LEDs autorizados; secrets.h ignorado.")
