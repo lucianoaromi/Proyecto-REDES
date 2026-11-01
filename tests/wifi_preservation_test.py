@@ -28,6 +28,10 @@ assert after.index("pinMode(LED_RAIN, OUTPUT);") < after.index("ledApi.begin();"
 assert after.count("ledApi.weather(tempApi);") == 1
 assert "digitalWrite(LED_API" not in after
 assert 'ledApi.handleRequest(requestLine.c_str(), client)' in after
+# El contador se verifica con el bloque /data real y sus pruebas especificas.
+after = re.sub(r"^[^\n]*HTTP_CLIENTS_BEGIN[^\n]*\n[\s\S]*?^[^\n]*HTTP_CLIENTS_END[^\n]*\n", "", after, flags=re.M)
+after = after.replace('HttpActiveClients::isDataRequest(requestLine.c_str())', 'requestLine.indexOf("GET /data") >= 0')
+after = after.replace("                .then(r => {\n                    if (!r.ok) throw new Error('Error HTTP /data');\n                    return r.json();\n                })", "                .then(r => r.json())")
 # Las sondas temporales son sentencias independientes; comparar la logica sin ellas.
 after = re.sub(r"^[ \t]*PERF_[^\n]*\n", "", after, flags=re.M)
 # Las adiciones D6/D7 se ejecutan en las pruebas del controlador, lluvia e interfaz.

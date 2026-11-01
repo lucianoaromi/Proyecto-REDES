@@ -25,6 +25,10 @@
 #include "wifi_provisioning.h"
 #include "http_timing_diagnostics.h"
 #include "led_api_control.h"
+// HTTP_CLIENTS_BEGIN
+#include "http_active_clients.h"
+HttpActiveClients httpClients;
+// HTTP_CLIENTS_END
 
 // Diagnostico temporal: cambiar a 0 para compilar sin trazas de conexion.
 #define DIAGNOSTICO_CONEXIONES 1
@@ -1169,6 +1173,9 @@ void loop() {
   // =============================
   // SERVIDOR WEB
   // =============================
+  // HTTP_CLIENTS_BEGIN
+  httpClients.expire(millis());
+  // HTTP_CLIENTS_END
   if (!serviciosRedIniciados || wifiProvisioning.portalActive()) return;
   WiFiClient client = server.available();
   if (!client) {
@@ -1210,8 +1217,11 @@ void loop() {
   }
   // LED_CONTROL_END
   // /data
-  if (requestLine.indexOf("GET /data") >= 0) {
+  if (HttpActiveClients::isDataRequest(requestLine.c_str())) {
     PERF_HTTP_ROUTE(F("/data"));
+    // HTTP_CLIENTS_BEGIN
+    httpClients.record(static_cast<uint32_t>(client.remoteIP()), millis());
+    // HTTP_CLIENTS_END
     String fechaHora = obtenerFechaHora();
 
     float tOut = isnan(tempFiltrada) ? TEMPERATURA : tempFiltrada;
@@ -1272,6 +1282,10 @@ void loop() {
     }
     client.print("]");
     imprimirClimaExterior(client);
+    // HTTP_CLIENTS_BEGIN
+    client.print(",\"clients\":");
+    httpClients.printState(client);
+    // HTTP_CLIENTS_END
     // LED_CONTROL_BEGIN
     client.print(",\"led\":");
     ledApi.printState(client);
@@ -1481,6 +1495,11 @@ void loop() {
             gap: 2px;
         }
 
+        /* HTTP_CLIENTS_BEGIN */
+        .http-clients { display: flex; align-items: center; gap: 5px; margin-top: 5px;
+            font-size: 11px; color: #AAA; }
+        .http-clients .material-symbols-rounded { font-size: 16px; }
+        /* HTTP_CLIENTS_END */
         .update-label {
             font-size: 9px;
             letter-spacing: 0.16em;
@@ -1958,6 +1977,12 @@ void loop() {
         <div class="header-update">
             <span class="update-label">Actualización de pantalla</span>
             <span id="time" class="update-value">--/--/---- --:--:--</span>
+            <!-- HTTP_CLIENTS_BEGIN -->
+            <span class="http-clients" title="IPv4 distintas con GET /data en los últimos 30 s; + indica límite de registros">
+                <span class="material-symbols-rounded" aria-hidden="true">devices</span>
+                <span id="httpClients" role="status" aria-live="polite">Clientes activos: --</span>
+            </span>
+            <!-- HTTP_CLIENTS_END -->
         </div>
     </div>
 
@@ -2353,12 +2378,24 @@ void loop() {
         }
         // LED_CONTROL_END
 
+        // HTTP_CLIENTS_BEGIN
+        function mostrarClientes(state) {
+            const valid = state && Number.isInteger(state.active) && state.active >= 0 &&
+                state.active <= 8 && typeof state.limited === 'boolean';
+            document.getElementById('httpClients').textContent = valid ?
+                `Clientes activos: ${state.active}${state.limited ? '+' : ''}` :
+                'Clientes activos: sin conexión';
+        }
+        // HTTP_CLIENTS_END
         function actualizarDatos() {
             // LED_CONTROL_BEGIN
             const ledVersion = ledGeneration;
             // LED_CONTROL_END
             fetch('/data')
-                .then(r => r.json())
+                .then(r => {
+                    if (!r.ok) throw new Error('Error HTTP /data');
+                    return r.json();
+                })
                 .then(d => {
                     document.getElementById('temp').textContent = d.temp.toFixed(1);
                     document.getElementById('hum').textContent = d.hum.toFixed(0);
@@ -2368,6 +2405,9 @@ void loop() {
                     document.getElementById('hmax').textContent = d.hmax.toFixed(0);
                     document.getElementById('time').textContent = d.time;
                     actualizarClimaExterior(d.weather);
+                    // HTTP_CLIENTS_BEGIN
+                    mostrarClientes(d.clients);
+                    // HTTP_CLIENTS_END
                     // LED_CONTROL_BEGIN
                     if (!ledPending && ledVersion === ledGeneration) {
                         try {
@@ -2420,6 +2460,9 @@ void loop() {
                 })
                 .catch(err => {
                     console.error('Error al obtener /data', err);
+                    // HTTP_CLIENTS_BEGIN
+                    mostrarClientes(null);
+                    // HTTP_CLIENTS_END
                     actualizarClimaExterior(null, true);
                     // LED_CONTROL_BEGIN
                     if (!ledPending && ledVersion === ledGeneration) errorLed();

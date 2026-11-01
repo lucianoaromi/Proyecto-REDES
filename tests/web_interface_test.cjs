@@ -15,14 +15,14 @@ const path = require('node:path');
     const state = {
         weather: { valid: false, temp: null, hum: null, updated: null, stale: false },
         temp: 26.8, hum: 52, offline: false, clears: 0, csvRequests: 0,
-        led: ledState('auto', false), ledFailure: false
+        led: ledState('auto', false), ledFailure: false, clients: { active: 1, limited: false }
     };
     const stamp = '18/10/2026 05:10:00';
     const payload = () => ({
         temp: state.temp, hum: state.hum, tmin: 24.1, tmax: 28.4, hmin: 48, hmax: 60,
         time: '18/10/2026 05:12:00', hcount: 3, histT: [26.2, 26.6, 26.8], histH: [51, 52, 52],
         moonIcon: '🌓', moonName: 'Cuarto creciente', nextNewMoon: '09/11/2026', nextFullMoon: '26/10/2026',
-        weather: state.weather, led: state.led
+        weather: state.weather, led: state.led, clients: state.clients
     });
     const server = http.createServer((req, res) => {
         if (req.url === '/') { res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' }); return res.end(html); }
@@ -66,6 +66,21 @@ const path = require('node:path');
         assert.equal(await page.locator('#weatherTemp').textContent(), '--');
         assert.equal(await page.locator('#weatherUpdated').textContent(), 'Sin datos');
         assert.equal(await page.locator('#ledSwitch').getAttribute('aria-label'), 'LEDs D6/D7');
+        assert.equal(await page.locator('#httpClients').textContent(), 'Clientes activos: 1');
+        state.clients = { active: 2, limited: false };
+        await page.evaluate(() => actualizarDatos());
+        await page.waitForFunction(() => document.getElementById('httpClients').textContent === 'Clientes activos: 2');
+        state.clients = { active: 8, limited: true };
+        await page.evaluate(() => actualizarDatos());
+        await page.waitForFunction(() => document.getElementById('httpClients').textContent === 'Clientes activos: 8+');
+        state.offline = true;
+        await page.evaluate(() => actualizarDatos());
+        await page.waitForFunction(() => document.getElementById('httpClients').textContent === 'Clientes activos: sin conexión');
+        state.offline = false;
+        state.clients = { active: 1, limited: false };
+        await page.evaluate(() => actualizarDatos());
+        await page.waitForFunction(() => document.getElementById('httpClients').textContent === 'Clientes activos: 1');
+
 
         // El switch espera al ESP; no cambia optimistamente ni ante HTTP fallido.
         assert.equal(await page.locator('#ledSwitch').getAttribute('aria-checked'), 'false');
@@ -98,6 +113,7 @@ const path = require('node:path');
         await peer.waitForFunction(() => !document.getElementById('ledSwitch').disabled);
         await peer.locator('#ledSwitch').click();
         await peer.waitForFunction(() => document.getElementById('ledStatus').textContent === 'Manual · ON');
+        await page.bringToFront(); // Evitar throttling de requestAnimationFrame en la pagina de fondo.
         await page.evaluate(() => actualizarDatos());
         await page.waitForFunction(() => document.getElementById('ledStatus').textContent === 'Manual · ON');
         assert.equal(await peer.locator('#ledSwitch').getAttribute('aria-checked'), 'true');
@@ -321,6 +337,8 @@ const path = require('node:path');
             });
             assert.ok(ledLayout.controlLeft >= ledLayout.titleRight, `LED solapado a ${width}px`);
             assert.ok(ledLayout.topDelta < 2, `LED fuera del encabezado a ${width}px`);
+            const counter = await page.locator('#httpClients').boundingBox();
+            assert.ok(counter.x >= 0 && counter.x + counter.width <= width, `contador fuera de pantalla a ${width}px`);
             if (width > 680) {
                 assert.ok(Math.abs(layout.cards[0].top - layout.cards[1].top) < 1);
                 assert.ok(Math.abs(layout.cards[0].height - layout.cards[1].height) < 1);

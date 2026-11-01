@@ -13,7 +13,7 @@ args.output.mkdir(parents=True, exist_ok=True)
 source = (Path(__file__).resolve().parents[1] / "ESP8266_DHT22/ESP8266_DHT22.ino").read_text(encoding="utf-8")
 helper = source.split("void imprimirClimaExterior(Print &output) {", 1)[1].split("\nvoid loop()", 1)[0]
 helper = "void imprimirClimaExterior(Print &output) {" + helper
-endpoint = source.split('  if (requestLine.indexOf("GET /data") >= 0) {\n', 1)[1].split("\n  // /csv", 1)[0]
+endpoint = source.split('  if (HttpActiveClients::isDataRequest(requestLine.c_str())) {\n', 1)[1].split("\n  // /csv", 1)[0]
 endpoint = endpoint.rsplit("\n  }", 1)[0]
 prefix = r'''
 #define PERF_HTTP_ROUTE(...) ((void)0)
@@ -32,10 +32,13 @@ prefix = r'''
 #define LOW 0
 void digitalWrite(unsigned char, int) {}
 #include "led_api_control.h"
+#include "http_active_clients.h"
+HttpActiveClients httpClients;
 void rainMode(bool, bool) {}
 bool rainState() { return false; }
 LedApiControl ledApi(12, rainMode, rainState);
 using String = std::string;
+uint32_t remoteAddress = 0x0100007f;
 struct Print {
   std::ostringstream text;
   void print(const char *s) { text << s; }
@@ -45,6 +48,7 @@ struct Print {
   void print(float n, int digits) { text << std::fixed << std::setprecision(digits) << n; }
   void println(const char *s = "") { text << s << "\r\n"; }
   void stop() {}
+  uint32_t remoteIP() { return remoteAddress; }
 };
 float tempApi = NAN, humApi = NAN;
 time_t weatherLastSuccessTime = 0;
@@ -81,6 +85,10 @@ int main() {
   ticks = weatherLastSuccessMillis; tempApi = 0; humApi = 0; emit();
   tempApi = -5.2f; humApi = 100; emit();
   weatherLastSuccessMillis = UINT32_MAX - 1000; ticks = 999; emit();
+  httpClients = HttpActiveClients(); remoteAddress = 1; ticks = 0; emit();
+  remoteAddress = 2; ticks = 100; emit();
+  remoteAddress = 1; ticks = 200; emit();
+  ticks = 30100; emit();
 }
 '''
 cpp = args.output / "endpoint_under_test.cpp"
@@ -107,10 +115,11 @@ if args.wasi:
 else:
     result = subprocess.run([str(binary)], capture_output=True, text=True, encoding="utf-8", check=True)
 rows = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
-assert len(rows) == 8
+assert len(rows) == 12
 legacy = {"temp", "hum", "tmin", "tmax", "hmin", "hmax", "time", "hcount", "moonIcon", "moonName", "nextNewMoon", "nextFullMoon", "histT", "histH"}
-for row in rows:
-    assert set(row) == legacy | {"weather", "led"}
+for row in rows[:8]:
+    assert set(row) == legacy | {"weather", "led", "clients"}
+    assert row["clients"] == {"active": 1, "limited": False}
     assert row["led"] == {"mode": "auto", "on": False, "d6": False, "d7": False}
     assert row["temp"] == 26.8 and row["hum"] == 52 and row["histT"] == [26.2, 26.6, 26.8]
     assert row["hcount"] == 3 and row["moonName"] == "Cuarto creciente"
@@ -123,5 +132,7 @@ for index in (3, 4):
 assert rows[5]["weather"]["temp"] == 0 and rows[5]["weather"]["hum"] == 0
 assert rows[6]["weather"]["temp"] == -5.2 and rows[6]["weather"]["hum"] == 100
 assert not rows[7]["weather"]["stale"]
+assert [row["clients"]["active"] for row in rows[8:]] == [1, 2, 2, 1]
+assert all(not row["clients"]["limited"] for row in rows[8:])
 (args.output / "endpoint-results.json").write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
-print("PASS: 8 respuestas del endpoint C++ real: compatibilidad, null, ceros, humedad, fecha fija, fallo, antiguedad y millis().")
+print("PASS: 12 respuestas del endpoint C++ real (IPv4 unicas y expiracion incluidos): compatibilidad, null, ceros, humedad, fecha fija, fallo, antiguedad y millis().")
