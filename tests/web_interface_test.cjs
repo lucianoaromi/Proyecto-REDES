@@ -14,7 +14,7 @@ const path = require('node:path');
     const ledState = (mode, d6, d7 = d6) => ({ mode, on: d6 && d7, d6, d7 });
     const state = {
         weather: { valid: false, temp: null, hum: null, updated: null, stale: false },
-        temp: 26.8, hum: 52, offline: false, clears: 0, csvRequests: 0,
+        temp: 26.8, hum: 52, offline: false, clears: 0, csvRequests: 0, clearFailure: false,
         led: ledState('auto', false), ledFailure: false, clients: { active: 1, limited: false }
     };
     const stamp = '18/10/2026 05:10:00';
@@ -44,9 +44,9 @@ const path = require('node:path');
         if (req.url === '/csv') {
             state.csvRequests++;
             res.writeHead(200, { 'Content-Type': 'text/csv', 'Content-Disposition': 'attachment; filename="historial_prueba.csv"' });
-            return res.end('FechaHora,Temperatura,Hum.edad\r\n18/10/2026 05:10:00,26.8,52\r\n');
+            return res.end('FechaHora,TemperaturaLocal_C,HumedadLocal_pct,TemperaturaExterior_C,HumedadExterior_pct,FechaHoraWeatherAPI\r\n18/10/2026 05:10:00,26.8,52,,,\r\n01/11/2026 12:00:00,27.1,54,32.4,64,01/11/2026 11:55:00\r\n');
         }
-        if (req.url === '/clearcsv') { state.clears++; return res.end('CSV borrado correctamente'); }
+        if (req.url === '/clearcsv') { state.clears++; res.writeHead(state.clearFailure ? 500 : 200); return res.end(state.clearFailure ? 'Error CSV' : 'CSV borrado correctamente'); }
         res.writeHead(404); res.end();
     });
     await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
@@ -59,7 +59,8 @@ const path = require('node:path');
         const requests = [];
         page.on('pageerror', error => errors.push(error.message));
         page.on('request', req => requests.push(req.url()));
-        page.on('dialog', dialog => dialog.accept());
+        const dialogs = [];
+        page.on('dialog', dialog => { dialogs.push(dialog.message()); dialog.accept(); });
         await page.goto(`http://127.0.0.1:${server.address().port}`, { waitUntil: 'load' });
         await page.waitForFunction(() => typeof Chart !== 'undefined' && document.getElementById('temp').textContent === '26.8');
         await page.evaluate(() => document.fonts.ready);
@@ -360,10 +361,22 @@ const path = require('node:path');
         const download = await downloadPromise;
         assert.equal(download.suggestedFilename(), 'historial_prueba.csv');
         assert.ok(state.csvRequests > 0);
+        const csvFile = path.join(output, 'historial_prueba.csv');
+        await download.saveAs(csvFile);
+        const csvLines = fs.readFileSync(csvFile, 'utf8').trimEnd().split('\r\n');
+        assert.equal(csvLines.length, 3);
+        assert.ok(csvLines.every(line => line.split(',').length === 6));
+        assert.equal(csvLines[1], '18/10/2026 05:10:00,26.8,52,,,');
+        assert.equal(csvLines[2], '01/11/2026 12:00:00,27.1,54,32.4,64,01/11/2026 11:55:00');
         const clearRequest = page.waitForRequest(req => req.url().endsWith('/clearcsv'));
         await page.locator('#btnClear').click();
         await clearRequest;
         assert.ok(state.clears > 0); // Solo borra la fixture de este servidor local.
+        state.clearFailure = true;
+        const clearError = page.waitForEvent('dialog', dialog => dialog.message() === 'Error al borrar el CSV.');
+        await page.locator('#btnClear').click();
+        await clearError;
+        assert.ok(dialogs.includes('Error al borrar el CSV.'));
         assert.deepEqual(errors, []);
         assert.equal(requests.filter(url => /api\.(weatherapi|telegram)\./.test(url)).length, 0);
         fs.writeFileSync(path.join(output, 'layout-results.json'), JSON.stringify(layouts, null, 2));

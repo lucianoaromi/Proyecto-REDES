@@ -27,6 +27,7 @@
 #include "led_api_control.h"
 // HTTP_CLIENTS_BEGIN
 #include "http_active_clients.h"
+#include "csv_weather_format.h"
 HttpActiveClients httpClients;
 // HTTP_CLIENTS_END
 
@@ -219,7 +220,15 @@ void configurarTLS(WiFiClientSecure &client, const BearSSL::X509List &ca) {
 // =============================
 // LOG EN SPIFFS (HASTA ~1 MES)
 // =============================
-const char* LOG_FILE = "/historial.csv";
+// El archivo anterior permanece sin modificar durante la actualizacion.
+const char* LEGACY_LOG_FILE = "/historial.csv";
+const char* LOG_FILE = "/historial_clima.csv";
+const char* LOG_TEMP_FILE = "/historial_clima.tmp";
+const char* LOG_BACKUP_FILE = "/historial_clima.bak";
+bool csvReady = false;
+bool csvReadable = false;
+char primeraFechaLegacy[11] = "";
+char ultimaFechaLegacy[11] = "";
 const unsigned long MAX_LOG_LINES = 8640UL; // 24 × 60 / 5 * 30
 bool spiffsOk = false;
 unsigned long logLines = 0;
@@ -408,41 +417,109 @@ bool leerDHT() {
 // =============================
 // INICIALIZAR LOG EN SPIFFS
 // =============================
+bool crearCabeceraCSV(const char *path) {
+  File f = SPIFFS.open(path, "w");
+  if (!f) return false;
+  const size_t expected = strlen(WeatherCsv::HEADER) + 2;
+  const bool ok = f.println(WeatherCsv::HEADER) == expected && f.getWriteError() == 0;
+  f.flush();
+  const bool flushed = f.getWriteError() == 0;
+  f.close();
+  return ok && flushed;
+}
+
+bool cabeceraNuevaValida(const char *path) {
+  File f = SPIFFS.open(path, "r");
+  if (!f) return false;
+  char header[WeatherCsv::ROW_SIZE];
+  bool complete;
+  const bool ok = WeatherCsv::line(f, header, sizeof(header), complete) &&
+                  strcmp(header, WeatherCsv::HEADER) == 0;
+  f.close();
+  return ok;
+}
+
+bool recuperarRotacionCSV() {
+  if (SPIFFS.exists(LOG_BACKUP_FILE)) {
+    if (!SPIFFS.exists(LOG_FILE)) {
+      if (!SPIFFS.rename(LOG_BACKUP_FILE, LOG_FILE)) return false;
+    } else if (!cabeceraNuevaValida(LOG_FILE) || !SPIFFS.remove(LOG_BACKUP_FILE)) {
+      return false; // No elegir ni destruir un archivo de estado ambiguo.
+    }
+  }
+  if (SPIFFS.exists(LOG_TEMP_FILE) && !SPIFFS.remove(LOG_TEMP_FILE)) return false;
+  return true;
+}
+
+bool rotarCSV() {
+  // Preparar y verificar el reemplazo antes de apartar el archivo lleno.
+  if (SPIFFS.exists(LOG_BACKUP_FILE) || !crearCabeceraCSV(LOG_TEMP_FILE) ||
+      !cabeceraNuevaValida(LOG_TEMP_FILE)) return false;
+  if (!SPIFFS.rename(LOG_FILE, LOG_BACKUP_FILE)) return false;
+  if (!SPIFFS.rename(LOG_TEMP_FILE, LOG_FILE)) {
+    SPIFFS.rename(LOG_BACKUP_FILE, LOG_FILE);
+    return false;
+  }
+  if (!cabeceraNuevaValida(LOG_FILE)) return false;
+  const bool ok = SPIFFS.remove(LOG_BACKUP_FILE);
+  if (ok) {
+    logLines = 0;
+    memcpy(primeraFechaCSV, primeraFechaLegacy, sizeof(primeraFechaCSV));
+    memcpy(ultimaFechaCSV, ultimaFechaLegacy, sizeof(ultimaFechaCSV));
+  }
+  return ok;
+}
+
+// Solo lectura, una vez al arrancar. No reescribe ni migra el archivo anterior.
+bool resumirCSV(const char *path, bool legacy) {
+  File f = SPIFFS.open(path, "r");
+  if (!f) return false;
+  if (f.size() == 0) { f.close(); return legacy; }
+  char line[WeatherCsv::ROW_SIZE];
+  bool complete;
+  bool ok = WeatherCsv::line(f, line, sizeof(line), complete) &&
+      (legacy ? WeatherCsv::legacyHeader(line) : strcmp(line, WeatherCsv::HEADER) == 0);
+  while (ok && f.available()) {
+    ok = WeatherCsv::line(f, line, sizeof(line), complete) && WeatherCsv::columns(line, legacy);
+    if (ok) {
+      registrarFechaCSV(String(line));
+      if (!legacy) ++logLines;
+    }
+    yield();
+  }
+  f.close();
+  return ok;
+}
+
 void iniciarLog() {
   reiniciarFechasCSV();
-  if (!SPIFFS.exists(LOG_FILE)) {
-    File f = SPIFFS.open(LOG_FILE, "w");
-    if (f) {
-      f.println("FechaHora,Temperatura,Hum.edad");
-      f.close();
-    }
-    logLines = 0;
-    Serial.println("Log creado nuevo.");
-    return;
-  }
-
-  File f = SPIFFS.open(LOG_FILE, "r");
-  if (!f) {
-    logLines = 0;
-    Serial.println("No se pudo abrir log existente.");
-    return;
-  }
-
-  bool first = true;
   logLines = 0;
-
-  while (f.available()) {
-    String line = f.readStringUntil('\n');
-    if (first) {
-      first = false;
-      continue;
-    }
-    if (line.length() > 1) logLines++;
-    registrarFechaCSV(line);
+  csvReadable = false;
+  const bool storageOk = recuperarRotacionCSV();
+  csvReady = true;
+  if (SPIFFS.exists(LEGACY_LOG_FILE)) {
+    csvReady = resumirCSV(LEGACY_LOG_FILE, true);
   }
-
-  f.close();
-  Serial.printf("Log existente con %lu lineas.\n", logLines);
+  memcpy(primeraFechaLegacy, primeraFechaCSV, sizeof(primeraFechaLegacy));
+  memcpy(ultimaFechaLegacy, ultimaFechaCSV, sizeof(ultimaFechaLegacy));
+  if (!storageOk) {
+    csvReady = false;
+    Serial.println("[CSV] rotacion pendiente; archivos conservados.");
+    return;
+  }
+  if (!SPIFFS.exists(LOG_FILE)) {
+    csvReady = crearCabeceraCSV(LOG_FILE) && csvReady;
+  } else {
+    File current = SPIFFS.open(LOG_FILE, "r");
+    const bool empty = current && current.size() == 0;
+    current.close();
+    const bool currentOk = empty ? crearCabeceraCSV(LOG_FILE) : resumirCSV(LOG_FILE, false);
+    csvReady = currentOk && csvReady;
+  }
+  csvReadable = csvReady;
+  if (csvReady && logLines >= MAX_LOG_LINES) csvReady = rotarCSV();
+  Serial.printf("[CSV] registros nuevos=%lu, almacenamiento=%s\n", logLines,
+                csvReady ? "listo" : "no disponible; archivos conservados");
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -451,35 +528,38 @@ void iniciarLog() {
 // AGREGAR REGISTRO AL LOG
 // =============================
 void agregarRegistroLog(const String &fechaHora, float t, float h) {
-  if (!spiffsOk) return;
-
+  if (!spiffsOk || !csvReady) return;
+  char row[WeatherCsv::ROW_SIZE];
+  const size_t length = WeatherCsv::row(row, sizeof(row), fechaHora.c_str(), t, h,
+                                       tempApi, humApi, weatherLastSuccessTime);
+  if (!length) return;
+  FSInfo info;
+  if (!SPIFFS.info(info) || info.usedBytes > info.totalBytes ||
+      info.totalBytes - info.usedBytes < length + info.blockSize) {
+    Serial.println("[CSV] espacio insuficiente; archivos conservados.");
+    return;
+  }
   File f = SPIFFS.open(LOG_FILE, "a");
   if (!f) {
     Serial.println("No se pudo abrir log para escribir.");
     return;
   }
-
-  const size_t bytesEscritos = f.printf("%s,%.1f,%.0f\r\n", fechaHora.c_str(), t, h);
-  const bool escrito = bytesEscritos > 0 && f.getWriteError() == 0;
+  const size_t bytesEscritos = f.write(reinterpret_cast<const uint8_t *>(row), length);
+  f.flush();
+  const bool escrito = bytesEscritos == length && f.getWriteError() == 0;
   f.close();
-  if (!escrito) return;
-
-  logLines++;
+  if (!escrito) {
+    // Una escritura parcial no debe concatenarse con una muestra posterior.
+    csvReady = false;
+    csvReadable = false;
+    Serial.println("[CSV] error de escritura; revisar archivo antes de continuar.");
+    return;
+  }
+  ++logLines;
   registrarFechaCSV(fechaHora);
-
   if (logLines >= MAX_LOG_LINES) {
-    Serial.println("Limite de 1 mes alcanzado, reiniciando log...");
-    bool reiniciado = SPIFFS.remove(LOG_FILE);
-    File nf = SPIFFS.open(LOG_FILE, "w");
-    if (nf) {
-      nf.println("FechaHora,Temperatura,Hum.edad");
-      nf.close();
-      reiniciado = true;
-    }
-    if (reiniciado) {
-      logLines = 0;
-      reiniciarFechasCSV();
-    }
+    Serial.println("[CSV] limite del archivo nuevo alcanzado; rotando solo ese archivo.");
+    csvReady = rotarCSV();
   }
 }
 
@@ -968,51 +1048,12 @@ void atenderServiciosExternos() {
 // =============================
 String obtenerNombreCSV() {
   PERF_CSV_BEGIN(F("CSV_NOMBRE"));
-  if (!SPIFFS.exists(LOG_FILE)) return "historial_vacio.csv";
-
-  File f = SPIFFS.open(LOG_FILE, "r");
-  if (!f) return "historial_error.csv";
-  PERF_CSV_OPEN(f.size());
-
-  String linea;
-  String primeraFecha = "";
-  String ultimaFecha  = "";
-
-  bool esCabecera = true;
-
-  while (f.available()) {
-    linea = f.readStringUntil('\n');
-    PERF_CSV_LINE();
-
-    if (esCabecera) {
-      esCabecera = false;
-      continue;
-    }
-
-    if (linea.length() > 5) {
-      if (primeraFecha == "") {
-        primeraFecha = linea.substring(0, 10);
-      }
-      ultimaFecha = linea.substring(0, 10);
-    }
-  }
-
-  f.close();
-
-  if (primeraFecha == "" || ultimaFecha == "")
-    return "historial_sin_datos.csv";
-
+  if (!primeraFechaCSV[0] || !ultimaFechaCSV[0]) return "historial_sin_datos.csv";
   auto normalizar = [](String f) {
-    String d = f.substring(0, 2);
-    String m = f.substring(3, 5);
-    String y = f.substring(6, 10);
-    return y + m + d;
+    return f.substring(6, 10) + f.substring(3, 5) + f.substring(0, 2);
   };
-
-  String f1 = normalizar(primeraFecha);
-  String f2 = normalizar(ultimaFecha);
-
-  return "historial_" + f1 + "_" + f2 + ".csv";
+  return "historial_" + normalizar(String(primeraFechaCSV)) + "_" +
+         normalizar(String(ultimaFechaCSV)) + ".csv";
 }
 
 void obtenerFechasCSV(String &primera, String &ultima) {
@@ -1300,7 +1341,7 @@ void loop() {
   // /csv
   if (requestLine.startsWith("GET /csv ")) {
     PERF_HTTP_ROUTE(F("/csv"));
-    if (!spiffsOk || !SPIFFS.exists(LOG_FILE)) {
+    if (!spiffsOk || !csvReadable || SPIFFS.exists(LOG_BACKUP_FILE) || !SPIFFS.exists(LOG_FILE)) {
       PERF_HTTP_PHASE(Respuesta);
       client.println("HTTP/1.1 500 Internal Server Error");
       client.println("Content-Type: text/plain");
@@ -1313,32 +1354,40 @@ void loop() {
     }
 
     File f = SPIFFS.open(LOG_FILE, "r");
-    if (!f) {
+    const bool legacyExists = SPIFFS.exists(LEGACY_LOG_FILE);
+    File legacy;
+    if (legacyExists) legacy = SPIFFS.open(LEGACY_LOG_FILE, "r");
+    const bool hasLegacy = legacy && legacy.size() > 0;
+    char header[WeatherCsv::ROW_SIZE];
+    bool complete;
+    bool ok = f && WeatherCsv::line(f, header, sizeof(header), complete) &&
+              strcmp(header, WeatherCsv::HEADER) == 0;
+    if (legacyExists && !legacy) ok = false;
+    if (hasLegacy) ok = legacy && WeatherCsv::line(legacy, header, sizeof(header), complete) &&
+                        WeatherCsv::legacyHeader(header) && ok;
+    if (!ok) {
+      f.close(); legacy.close();
       PERF_HTTP_PHASE(Respuesta);
       client.println("HTTP/1.1 500 Internal Server Error");
       client.println("Content-Type: text/plain");
       client.println("Connection: close");
       client.println();
-      client.println("No se pudo abrir el log");
+      client.println("No se pudo abrir el historial CSV");
       PERF_HTTP_PHASE(Cierre);
       client.stop();
       return;
     }
-
     PERF_HTTP_PHASE(Respuesta);
     client.println("HTTP/1.1 200 OK");
-    client.println("Content-Type: text/csv");
+    client.println("Content-Type: text/csv; charset=utf-8");
     client.println("Content-Disposition: attachment; filename=\"" + obtenerNombreCSV() + "\"");
     client.println("Connection: close");
     client.println();
-
-    uint8_t buf[512];
-    while (f.available()) {
-      size_t len = f.read(buf, sizeof(buf));
-      client.write(buf, len);
-    }
-
-    f.close();
+    client.println(WeatherCsv::HEADER);
+    if (hasLegacy) ok = WeatherCsv::exportRows(legacy, client, true);
+    if (ok) ok = WeatherCsv::exportRows(f, client, false);
+    if (!ok) Serial.println("[CSV] descarga incompleta; verificar archivo o conexion.");
+    f.close(); legacy.close();
     PERF_HTTP_PHASE(Cierre);
     client.stop();
     return;
@@ -1347,31 +1396,21 @@ void loop() {
   // /clearcsv
   if (requestLine.startsWith("GET /clearcsv ")) {
     PERF_HTTP_ROUTE(F("/clearcsv"));
-    bool reiniciado = false;
-    if (spiffsOk && SPIFFS.exists(LOG_FILE)) {
-      reiniciado = SPIFFS.remove(LOG_FILE);
-    }
-
-    File nf = SPIFFS.open(LOG_FILE, "w");
-    if (nf) {
-      nf.println("FechaHora,Temperatura,Hum.edad");
-      nf.close();
-      reiniciado = true;
-    }
-
-    if (reiniciado) {
-      logLines = 0;
-      reiniciarFechasCSV();
-    }
-
-    Serial.println("🗑️ Historial CSV borrado manualmente.");
-
+    bool reiniciado = spiffsOk;
+    if (reiniciado && SPIFFS.exists(LEGACY_LOG_FILE)) reiniciado = SPIFFS.remove(LEGACY_LOG_FILE);
+    if (reiniciado && SPIFFS.exists(LOG_FILE)) reiniciado = SPIFFS.remove(LOG_FILE);
+    if (reiniciado && SPIFFS.exists(LOG_BACKUP_FILE)) reiniciado = SPIFFS.remove(LOG_BACKUP_FILE);
+    if (reiniciado && SPIFFS.exists(LOG_TEMP_FILE)) reiniciado = SPIFFS.remove(LOG_TEMP_FILE);
+    if (reiniciado) reiniciado = crearCabeceraCSV(LOG_FILE);
+    if (spiffsOk) iniciarLog();
+    reiniciado = reiniciado && csvReady;
+    Serial.println(reiniciado ? "[CSV] historial borrado manualmente." : "[CSV] fallo al borrar historial.");
     PERF_HTTP_PHASE(Respuesta);
-    client.println("HTTP/1.1 200 OK");
+    client.println(reiniciado ? "HTTP/1.1 200 OK" : "HTTP/1.1 500 Internal Server Error");
     client.println("Content-Type: text/plain");
     client.println("Connection: close");
     client.println();
-    client.println("CSV borrado correctamente");
+    client.println(reiniciado ? "CSV borrado correctamente" : "No se pudo borrar el historial CSV");
     PERF_HTTP_PHASE(Cierre);
     client.stop();
     return;
@@ -2534,7 +2573,10 @@ void loop() {
         document.getElementById('btnClear').addEventListener('click', function () {
             if (confirm('¿Seguro que deseas borrar TODO el historial del CSV?')) {
                 fetch('/clearcsv')
-                    .then(() => alert('Historial CSV borrado correctamente.'))
+                    .then(r => {
+                        if (!r.ok) throw new Error('Error al borrar CSV');
+                        alert('Historial CSV borrado correctamente.');
+                    })
                     .catch(() => alert('Error al borrar el CSV.'));
             }
         });

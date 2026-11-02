@@ -32,6 +32,11 @@ assert 'ledApi.handleRequest(requestLine.c_str(), client)' in after
 after = re.sub(r"^[^\n]*HTTP_CLIENTS_BEGIN[^\n]*\n[\s\S]*?^[^\n]*HTTP_CLIENTS_END[^\n]*\n", "", after, flags=re.M)
 after = after.replace('HttpActiveClients::isDataRequest(requestLine.c_str())', 'requestLine.indexOf("GET /data") >= 0')
 after = after.replace("                .then(r => {\n                    if (!r.ok) throw new Error('Error HTTP /data');\n                    return r.json();\n                })", "                .then(r => r.json())")
+# El CSV combinado tiene pruebas propias; comparar intacto el resto del servidor.
+after = after.replace(function(after, "obtenerNombreCSV"), function(before, "obtenerNombreCSV"))
+start_csv, end_csv = "  // /csv\n", "  // /clearcsv\n"
+after = after.split(start_csv, 1)[0] + start_csv + before.split(start_csv, 1)[1].split(end_csv, 1)[0] + end_csv + after.split(end_csv, 1)[1]
+after = after.replace("                    .then(r => {\n                        if (!r.ok) throw new Error('Error al borrar CSV');\n                        alert('Historial CSV borrado correctamente.');\n                    })", "                    .then(() => alert('Historial CSV borrado correctamente.'))")
 # Las sondas temporales son sentencias independientes; comparar la logica sin ellas.
 after = re.sub(r"^[ \t]*PERF_[^\n]*\n", "", after, flags=re.M)
 # Las adiciones D6/D7 se ejecutan en las pruebas del controlador, lluvia e interfaz.

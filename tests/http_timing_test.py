@@ -100,7 +100,7 @@ int main() {
   check(Serial.log.str().empty(), "sin trazas al desactivar");
 #endif
   reads = 0; clearLog();
-  check(obtenerNombreCSV() == "historial_20261001_20261019.csv" && reads == 5002, "nombre intacto y recorrido");
+  check(obtenerNombreCSV() == "historial_20261001_20261019.csv" && reads == 0, "nombre combinado desde cache sin recorrido");
   lines = {"FechaHora,Temperatura,Hum.edad"};
   reiniciarFechasCSV();
   String first, last;
