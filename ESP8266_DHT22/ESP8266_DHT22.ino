@@ -22,14 +22,23 @@
 #include "secrets.h"
 #include "tls_certificates.h"
 #include "weather_json.h"
+#include "wifi_provisioning.h"
+#include "http_timing_diagnostics.h"
+#include "led_api_control.h"
+// HTTP_CLIENTS_BEGIN
+#include "http_active_clients.h"
+#include "csv_weather_format.h"
+HttpActiveClients httpClients;
+// HTTP_CLIENTS_END
 
 // Diagnostico temporal: cambiar a 0 para compilar sin trazas de conexion.
 #define DIAGNOSTICO_CONEXIONES 1
 
 // =============================
-// Brillo del LED de lluvia (0 = apagado, 1023 = máximo)
+// Brillo del LED de lluvia (Core 3.1.2: 0 = apagado, 255 = máximo)
 // =============================
 const uint16_t BRILLO_LLUVIA = 15; 
+const uint16_t BRILLO_LLUVIA_MANUAL = 64; // Core 3.1.2: PWM 0..255 (~25%).
 
 
 // =============================
@@ -72,14 +81,14 @@ DHT dht(SENSOR, DHTTYPE);
 void actualizarLedRain(unsigned long ahora);
 void actualizarPatronLluvia();
 
-// Variables globales (valor crudo promediado)
+// Variables globales (ultima lectura valida con offsets)
 float TEMPERATURA = 0;
 float HUMEDAD     = 0;
 
 // Variables filtradas (suavizadas)
 float tempFiltrada = NAN;
 float humFiltrada  = NAN;
-const float ALPHA_FILTRO = 0.2;   // 0.1 = más suave, 0.5 = más rápido
+const float ALPHA_FILTRO = 0.5;   // 0.1 = más suave, 0.5 = más rápido
 
 float tempMax = -100, tempMin = 200;
 float humMax  = 0,    humMin  = 100;
@@ -89,7 +98,7 @@ unsigned long lastRead = 0;
 // =============================
 // INTERVALOS DE TIEMPO
 // =============================
-const unsigned long READ_INTERVAL_MS      = 10000UL;  // 10 segundos
+const unsigned long READ_INTERVAL_MS      = 2500UL;   // 2,5 segundos (DHT: minimo 2 s)
 const unsigned long HIST_MINUTE_INTERVAL  = 60000UL;  // 1 minuto
 const unsigned long CSV_SAVE_INTERVAL_MS  = 300000UL; // 5 minutos
 
@@ -124,6 +133,9 @@ uint16_t csvCount = 0;
 // =============================
 const uint8_t LED_API  = D6;  // LED temp API
 const uint8_t LED_RAIN = D7;  // LED lluvia API
+void cambiarControlLluvia(bool manual, bool on);
+bool estadoLedLluvia();
+LedApiControl ledApi(LED_API, cambiarControlLluvia, estadoLedLluvia);
 
 float tempApi   = NAN;   // última temperatura desde la API
 float humApi    = NAN;
@@ -162,9 +174,15 @@ unsigned long lastAlert = 0;                 // tiempo del último aviso
 const unsigned long ALERT_INTERVAL = 300000; // 5 MINUTOS
 
 WiFiServer server(80);
+WifiProvisioning wifiProvisioning;
+bool serviciosRedIniciados = false;
+// Diagnostico temporal: eventos STA sin SSID, claves ni otros datos sensibles.
+WiFiEventHandler wifiAsociadaDiag;
+WiFiEventHandler wifiDesconectadaDiag;
+WiFiEventHandler wifiIpv4Diag;
+WiFiEventHandler wifiDhcpDiag;
 
 // TLS se ejecuta de a una conexion y solo cuando no hay un cliente HTTP pendiente.
-const unsigned long WIFI_START_TIMEOUT_MS = 15000UL;
 const unsigned long EXTERNAL_RETRY_MS = 30000UL;
 const uint16_t EXTERNAL_IO_TIMEOUT_MS = 5000;
 const time_t MIN_TLS_TIME = 1704067200; // 01/01/2024 UTC: control de plausibilidad
@@ -183,6 +201,7 @@ bool horaValidaParaTLS() {
 }
 
 bool puedeIniciarTLS() {
+  if (!serviciosRedIniciados || wifiProvisioning.portalActive()) return false;
   if (WiFi.status() != WL_CONNECTED || !horaValidaParaTLS()) return false;
   // RX de 16 KiB evita depender de MFLN. Reservar margen para TLS y las estructuras JSON.
   return ESP.getFreeHeap() >= 35000 && ESP.getMaxFreeBlockSize() >= 17000;
@@ -201,10 +220,33 @@ void configurarTLS(WiFiClientSecure &client, const BearSSL::X509List &ca) {
 // =============================
 // LOG EN SPIFFS (HASTA ~1 MES)
 // =============================
-const char* LOG_FILE = "/historial.csv";
+// El archivo anterior permanece sin modificar durante la actualizacion.
+const char* LEGACY_LOG_FILE = "/historial.csv";
+const char* LOG_FILE = "/historial_clima.csv";
+const char* LOG_TEMP_FILE = "/historial_clima.tmp";
+const char* LOG_BACKUP_FILE = "/historial_clima.bak";
+bool csvReady = false;
+bool csvReadable = false;
+char primeraFechaLegacy[11] = "";
+char ultimaFechaLegacy[11] = "";
 const unsigned long MAX_LOG_LINES = 8640UL; // 24 × 60 / 5 * 30
 bool spiffsOk = false;
 unsigned long logLines = 0;
+char primeraFechaCSV[11] = "";
+char ultimaFechaCSV[11] = "";
+
+void reiniciarFechasCSV() {
+  primeraFechaCSV[0] = '\0';
+  ultimaFechaCSV[0] = '\0';
+}
+
+void registrarFechaCSV(const String &linea) {
+  if (linea.length() <= 5) return;
+  if (primeraFechaCSV[0] == '\0') {
+    linea.toCharArray(primeraFechaCSV, sizeof(primeraFechaCSV));
+  }
+  linea.toCharArray(ultimaFechaCSV, sizeof(ultimaFechaCSV));
+}
 
 // =============================
 // HORA NTP (ARGENTINA GMT-3)
@@ -342,28 +384,13 @@ void actualizarFiltro() {
 // LECTURA DEL DHT22
 // =============================
 bool leerDHT() {
-  float sumaT = 0, sumaH = 0;
-  int muestras = 10;
-  int validas  = 0;
+  // DHT conserva la trama durante 2 s: ambos valores pertenecen a una sola lectura.
+  const float t = dht.readTemperature();
+  const float h = dht.readHumidity();
+  if (isnan(t) || isnan(h)) return false;
 
-  for (int i = 0; i < muestras; i++) {
-    float t = dht.readTemperature();
-    float h = dht.readHumidity();
-
-    if (!isnan(t) && !isnan(h)) {
-      sumaT += t;
-      sumaH += h;
-      validas++;
-    }
-    // Evitar pausar demasiado el parpadeo del LED de lluvia
-    actualizarLedRain(millis());
-    delay(10);
-  }
-
-  if (validas == 0) return false;
-
-  TEMPERATURA = sumaT / validas;
-  HUMEDAD     = sumaH / validas;
+  TEMPERATURA = t;
+  HUMEDAD     = h;
 
   TEMPERATURA += OFFSET_TEMP;
   HUMEDAD     += OFFSET_HUM;
@@ -390,39 +417,109 @@ bool leerDHT() {
 // =============================
 // INICIALIZAR LOG EN SPIFFS
 // =============================
-void iniciarLog() {
-  if (!SPIFFS.exists(LOG_FILE)) {
-    File f = SPIFFS.open(LOG_FILE, "w");
-    if (f) {
-      f.println("FechaHora,Temperatura,Hum.edad");
-      f.close();
-    }
-    logLines = 0;
-    Serial.println("Log creado nuevo.");
-    return;
-  }
-
-  File f = SPIFFS.open(LOG_FILE, "r");
-  if (!f) {
-    logLines = 0;
-    Serial.println("No se pudo abrir log existente.");
-    return;
-  }
-
-  bool first = true;
-  logLines = 0;
-
-  while (f.available()) {
-    String line = f.readStringUntil('\n');
-    if (first) {
-      first = false;
-      continue;
-    }
-    if (line.length() > 1) logLines++;
-  }
-
+bool crearCabeceraCSV(const char *path) {
+  File f = SPIFFS.open(path, "w");
+  if (!f) return false;
+  const size_t expected = strlen(WeatherCsv::HEADER) + 2;
+  const bool ok = f.println(WeatherCsv::HEADER) == expected && f.getWriteError() == 0;
+  f.flush();
+  const bool flushed = f.getWriteError() == 0;
   f.close();
-  Serial.printf("Log existente con %lu lineas.\n", logLines);
+  return ok && flushed;
+}
+
+bool cabeceraNuevaValida(const char *path) {
+  File f = SPIFFS.open(path, "r");
+  if (!f) return false;
+  char header[WeatherCsv::ROW_SIZE];
+  bool complete;
+  const bool ok = WeatherCsv::line(f, header, sizeof(header), complete) &&
+                  strcmp(header, WeatherCsv::HEADER) == 0;
+  f.close();
+  return ok;
+}
+
+bool recuperarRotacionCSV() {
+  if (SPIFFS.exists(LOG_BACKUP_FILE)) {
+    if (!SPIFFS.exists(LOG_FILE)) {
+      if (!SPIFFS.rename(LOG_BACKUP_FILE, LOG_FILE)) return false;
+    } else if (!cabeceraNuevaValida(LOG_FILE) || !SPIFFS.remove(LOG_BACKUP_FILE)) {
+      return false; // No elegir ni destruir un archivo de estado ambiguo.
+    }
+  }
+  if (SPIFFS.exists(LOG_TEMP_FILE) && !SPIFFS.remove(LOG_TEMP_FILE)) return false;
+  return true;
+}
+
+bool rotarCSV() {
+  // Preparar y verificar el reemplazo antes de apartar el archivo lleno.
+  if (SPIFFS.exists(LOG_BACKUP_FILE) || !crearCabeceraCSV(LOG_TEMP_FILE) ||
+      !cabeceraNuevaValida(LOG_TEMP_FILE)) return false;
+  if (!SPIFFS.rename(LOG_FILE, LOG_BACKUP_FILE)) return false;
+  if (!SPIFFS.rename(LOG_TEMP_FILE, LOG_FILE)) {
+    SPIFFS.rename(LOG_BACKUP_FILE, LOG_FILE);
+    return false;
+  }
+  if (!cabeceraNuevaValida(LOG_FILE)) return false;
+  const bool ok = SPIFFS.remove(LOG_BACKUP_FILE);
+  if (ok) {
+    logLines = 0;
+    memcpy(primeraFechaCSV, primeraFechaLegacy, sizeof(primeraFechaCSV));
+    memcpy(ultimaFechaCSV, ultimaFechaLegacy, sizeof(ultimaFechaCSV));
+  }
+  return ok;
+}
+
+// Solo lectura, una vez al arrancar. No reescribe ni migra el archivo anterior.
+bool resumirCSV(const char *path, bool legacy) {
+  File f = SPIFFS.open(path, "r");
+  if (!f) return false;
+  if (f.size() == 0) { f.close(); return legacy; }
+  char line[WeatherCsv::ROW_SIZE];
+  bool complete;
+  bool ok = WeatherCsv::line(f, line, sizeof(line), complete) &&
+      (legacy ? WeatherCsv::legacyHeader(line) : strcmp(line, WeatherCsv::HEADER) == 0);
+  while (ok && f.available()) {
+    ok = WeatherCsv::line(f, line, sizeof(line), complete) && WeatherCsv::columns(line, legacy);
+    if (ok) {
+      registrarFechaCSV(String(line));
+      if (!legacy) ++logLines;
+    }
+    yield();
+  }
+  f.close();
+  return ok;
+}
+
+void iniciarLog() {
+  reiniciarFechasCSV();
+  logLines = 0;
+  csvReadable = false;
+  const bool storageOk = recuperarRotacionCSV();
+  csvReady = true;
+  if (SPIFFS.exists(LEGACY_LOG_FILE)) {
+    csvReady = resumirCSV(LEGACY_LOG_FILE, true);
+  }
+  memcpy(primeraFechaLegacy, primeraFechaCSV, sizeof(primeraFechaLegacy));
+  memcpy(ultimaFechaLegacy, ultimaFechaCSV, sizeof(ultimaFechaLegacy));
+  if (!storageOk) {
+    csvReady = false;
+    Serial.println("[CSV] rotacion pendiente; archivos conservados.");
+    return;
+  }
+  if (!SPIFFS.exists(LOG_FILE)) {
+    csvReady = crearCabeceraCSV(LOG_FILE) && csvReady;
+  } else {
+    File current = SPIFFS.open(LOG_FILE, "r");
+    const bool empty = current && current.size() == 0;
+    current.close();
+    const bool currentOk = empty ? crearCabeceraCSV(LOG_FILE) : resumirCSV(LOG_FILE, false);
+    csvReady = currentOk && csvReady;
+  }
+  csvReadable = csvReady;
+  if (csvReady && logLines >= MAX_LOG_LINES) csvReady = rotarCSV();
+  Serial.printf("[CSV] registros nuevos=%lu, almacenamiento=%s\n", logLines,
+                csvReady ? "listo" : "no disponible; archivos conservados");
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -431,28 +528,38 @@ void iniciarLog() {
 // AGREGAR REGISTRO AL LOG
 // =============================
 void agregarRegistroLog(const String &fechaHora, float t, float h) {
-  if (!spiffsOk) return;
-
+  if (!spiffsOk || !csvReady) return;
+  char row[WeatherCsv::ROW_SIZE];
+  const size_t length = WeatherCsv::row(row, sizeof(row), fechaHora.c_str(), t, h,
+                                       tempApi, humApi, weatherLastSuccessTime);
+  if (!length) return;
+  FSInfo info;
+  if (!SPIFFS.info(info) || info.usedBytes > info.totalBytes ||
+      info.totalBytes - info.usedBytes < length + info.blockSize) {
+    Serial.println("[CSV] espacio insuficiente; archivos conservados.");
+    return;
+  }
   File f = SPIFFS.open(LOG_FILE, "a");
   if (!f) {
     Serial.println("No se pudo abrir log para escribir.");
     return;
   }
-
-  f.printf("%s,%.1f,%.0f\r\n", fechaHora.c_str(), t, h);
+  const size_t bytesEscritos = f.write(reinterpret_cast<const uint8_t *>(row), length);
+  f.flush();
+  const bool escrito = bytesEscritos == length && f.getWriteError() == 0;
   f.close();
-
-  logLines++;
-
+  if (!escrito) {
+    // Una escritura parcial no debe concatenarse con una muestra posterior.
+    csvReady = false;
+    csvReadable = false;
+    Serial.println("[CSV] error de escritura; revisar archivo antes de continuar.");
+    return;
+  }
+  ++logLines;
+  registrarFechaCSV(fechaHora);
   if (logLines >= MAX_LOG_LINES) {
-    Serial.println("Limite de 1 mes alcanzado, reiniciando log...");
-    SPIFFS.remove(LOG_FILE);
-    File nf = SPIFFS.open(LOG_FILE, "w");
-    if (nf) {
-      nf.println("FechaHora,Temperatura,Hum.edad");
-      nf.close();
-    }
-    logLines = 0;
+    Serial.println("[CSV] limite del archivo nuevo alcanzado; rotando solo ese archivo.");
+    csvReady = rotarCSV();
   }
 }
 
@@ -619,11 +726,13 @@ String faseIcono(int f) {
 // Ticker callbacks para patrón de lluvia
 // -----------------------------
 void IRAM_ATTR toggleRainLed() {
+  if (ledApi.manual() || !rainWindowActive) return;
   rainLedState = !rainLedState;
   analogWrite(LED_RAIN, rainLedState ? BRILLO_LLUVIA : 0);
 }
 
 void stopRainWindow() {
+  if (ledApi.manual()) return;
   rainWindowActive = false;
   rainLedState = false;
   rainBlinkTicker.detach();
@@ -631,6 +740,7 @@ void stopRainWindow() {
 }
 
 void startRainWindow() {
+  if (ledApi.manual() || !rainPatternEnabled) return;
   rainWindowActive = true;
   rainLedState = false;
   analogWrite(LED_RAIN, 0);
@@ -644,6 +754,7 @@ void startRainWindow() {
 }
 
 void disableRainPattern() {
+  if (ledApi.manual()) return;
   rainPatternEnabled = false;
   rainBurstTicker.detach();
   rainWindowEndTicker.detach();
@@ -652,6 +763,7 @@ void disableRainPattern() {
 }
 
 void enableRainPattern() {
+  if (ledApi.manual()) return;
   rainPatternEnabled = true;
   startRainWindow();            // arranca inmediatamente la primera ráfaga
   rainBurstTicker.detach();
@@ -660,8 +772,10 @@ void enableRainPattern() {
 
 // Controla el patrón según lluvia actual / pronóstico / modo prueba
 void actualizarPatronLluvia() {
+  if (ledApi.manual()) return;
   if (MODO_PRUEBA_LLUVIA) {
     disableRainPattern();
+    rainLedState = true;
     analogWrite(LED_RAIN, BRILLO_LLUVIA);
     return;
   }
@@ -669,6 +783,7 @@ void actualizarPatronLluvia() {
   // Lluvia actual: LED fijo encendido, sin parpadeo
   if (lluviaApi) {
     disableRainPattern();
+    rainLedState = true;
     analogWrite(LED_RAIN, BRILLO_LLUVIA);
     return;
   }
@@ -688,6 +803,26 @@ void actualizarPatronLluvia() {
 // Mantener compatibilidad con llamadas existentes
 void actualizarLedRain(unsigned long /*ahora*/) {
   actualizarPatronLluvia();
+}
+
+// Transiciones llamadas desde loop(), sin espera ni escritura en flash.
+void cambiarControlLluvia(bool manual, bool on) {
+  rainBurstTicker.detach();
+  rainWindowEndTicker.detach();
+  rainBlinkTicker.detach();
+  rainPatternEnabled = false;
+  rainWindowActive = false;
+  rainLedState = false;
+  if (manual) {
+    rainLedState = on;
+    analogWrite(LED_RAIN, on ? BRILLO_LLUVIA_MANUAL : 0);
+  } else {
+    actualizarPatronLluvia();
+  }
+}
+
+bool estadoLedLluvia() {
+  return rainLedState;
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -800,15 +935,7 @@ bool actualizarClimaApi() {
   actualizarPatronLluvia();
 
   // --------- LED DE TEMPERATURA ----------
-  const float UMBRAL_LED = 35.0;  // umbral temp API
-
-  if (!isnan(tempApi) && tempApi >= UMBRAL_LED) {
-    digitalWrite(LED_API, HIGH);
-    Serial.println("[API] LED_API ON (temp_api >= umbral)");
-  } else {
-    digitalWrite(LED_API, LOW);
-    Serial.println("[API] LED_API OFF (temp_api < umbral o dato inválido)");
-  }
+  ledApi.weather(tempApi);
   DIAG_ESTADO(ServicioDiag::WeatherAPI, EstadoDiag::Exito,
               F("EXITO"), F("HTTP 200 y JSON valido"));
   return true;
@@ -819,6 +946,7 @@ bool actualizarClimaApi() {
 // Sin espera de NTP en loop(): el callback del core habilita TLS cuando llega la hora.
 // Cada llamada ejecuta como maximo una operacion externa, sin conexiones TLS simultaneas.
 void atenderServiciosExternos() {
+  if (!serviciosRedIniciados || wifiProvisioning.portalActive()) return;
   unsigned long ahora = millis();
   bool telegramPendiente = avisoInicioPendiente || alertaPendiente.length() > 0;
   bool weatherPendiente = climaInicialPendiente || ahora - lastWeatherCheck >= WEATHER_INTERVAL;
@@ -919,77 +1047,19 @@ void atenderServiciosExternos() {
 // CSV nombre e info
 // =============================
 String obtenerNombreCSV() {
-  if (!SPIFFS.exists(LOG_FILE)) return "historial_vacio.csv";
-
-  File f = SPIFFS.open(LOG_FILE, "r");
-  if (!f) return "historial_error.csv";
-
-  String linea;
-  String primeraFecha = "";
-  String ultimaFecha  = "";
-
-  bool esCabecera = true;
-
-  while (f.available()) {
-    linea = f.readStringUntil('\n');
-
-    if (esCabecera) {
-      esCabecera = false;
-      continue;
-    }
-
-    if (linea.length() > 5) {
-      if (primeraFecha == "") {
-        primeraFecha = linea.substring(0, 10);
-      }
-      ultimaFecha = linea.substring(0, 10);
-    }
-  }
-
-  f.close();
-
-  if (primeraFecha == "" || ultimaFecha == "")
-    return "historial_sin_datos.csv";
-
+  PERF_CSV_BEGIN(F("CSV_NOMBRE"));
+  if (!primeraFechaCSV[0] || !ultimaFechaCSV[0]) return "historial_sin_datos.csv";
   auto normalizar = [](String f) {
-    String d = f.substring(0, 2);
-    String m = f.substring(3, 5);
-    String y = f.substring(6, 10);
-    return y + m + d;
+    return f.substring(6, 10) + f.substring(3, 5) + f.substring(0, 2);
   };
-
-  String f1 = normalizar(primeraFecha);
-  String f2 = normalizar(ultimaFecha);
-
-  return "historial_" + f1 + "_" + f2 + ".csv";
+  return "historial_" + normalizar(String(primeraFechaCSV)) + "_" +
+         normalizar(String(ultimaFechaCSV)) + ".csv";
 }
 
 void obtenerFechasCSV(String &primera, String &ultima) {
-  primera = "";
-  ultima  = "";
-
-  if (!SPIFFS.exists(LOG_FILE)) return;
-
-  File f = SPIFFS.open(LOG_FILE, "r");
-  if (!f) return;
-
-  String linea;
-  bool esCabecera = true;
-
-  while (f.available()) {
-    linea = f.readStringUntil('\n');
-
-    if (esCabecera) {
-      esCabecera = false;
-      continue;
-    }
-
-    if (linea.length() > 5) {
-      if (primera == "") primera = linea.substring(0, 10);
-      ultima = linea.substring(0, 10);
-    }
-  }
-  f.close();
+  PERF_CSV_BEGIN(F("CSV_FECHAS"));
+  primera = primeraFechaCSV;
+  ultima = ultimaFechaCSV;
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -999,37 +1069,34 @@ void obtenerFechasCSV(String &primera, String &ultima) {
 // =============================
 void setup() {
   Serial.begin(115200);
+  WifiProvisioning::memory(F("ARRANQUE"));
   dht.begin();
 
   pinMode(LED_API, OUTPUT);
-  digitalWrite(LED_API, LOW);
-
   pinMode(LED_RAIN, OUTPUT);   // NUEVO
-  analogWrite(LED_RAIN, 0); // NUEVO
+  ledApi.begin();
 
   DIAG_ESTADO(ServicioDiag::Telegram, EstadoDiag::Pendiente,
               F("PENDIENTE"), F("aviso de inicio"));
   DIAG_ESTADO(ServicioDiag::WeatherAPI, EstadoDiag::Pendiente,
               F("PENDIENTE"), F("primera consulta"));
-  WiFi.setAutoReconnect(true);
+  wifiAsociadaDiag = WiFi.onStationModeConnected([](const WiFiEventStationModeConnected &) {
+    Serial.print(F("[WM +")); Serial.print(millis()); Serial.println(F(" ms] STA_ASOCIADA"));
+  });
+  wifiDesconectadaDiag = WiFi.onStationModeDisconnected([](const WiFiEventStationModeDisconnected &event) {
+    Serial.print(F("[WM +")); Serial.print(millis());
+    Serial.print(F(" ms] STA_DESCONECTADA motivo="));
+    Serial.println(static_cast<int>(event.reason));
+  });
+  wifiIpv4Diag = WiFi.onStationModeGotIP([](const WiFiEventStationModeGotIP &) {
+    Serial.print(F("[WM +")); Serial.print(millis()); Serial.println(F(" ms] STA_IPV4_OBTENIDA"));
+  });
+  wifiDhcpDiag = WiFi.onStationModeDHCPTimeout([]() {
+    Serial.print(F("[WM +")); Serial.print(millis()); Serial.println(F(" ms] STA_DHCP_TIMEOUT"));
+  });
   DIAG_INICIO_WIFI();
-  WiFi.begin(ssid, password);
+  wifiProvisioning.begin(WIFI_CONFIG_AP_PASSWORD, ssid, password);
   ultimoIntentoWifi = millis();
-  Serial.print("Conectando a WiFi...");
-  while (WiFi.status() != WL_CONNECTED &&
-         millis() - ultimoIntentoWifi < WIFI_START_TIMEOUT_MS) {
-    delay(500);
-    Serial.print(".");
-  }
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println(" conectado!");
-    Serial.print("IP: ");
-    Serial.println(WiFi.localIP());
-  } else {
-    Serial.println(" sin conexion; se reintentara sin detener las mediciones.");
-    DIAG_WIFI_INICIO_FALLIDO();
-  }
-  DIAG_OBSERVAR_WIFI();
 
   settimeofday_cb([](bool desdeSntp) {
     if (desdeSntp) {
@@ -1037,10 +1104,6 @@ void setup() {
       DIAG_MARCAR_NTP();
     }
   });
-  DIAG_INICIO_NTP();
-  configTime(-3 * 3600, 0, "pool.ntp.org", "time.nist.gov");
-  Serial.println("[NTP] TLS pendiente hasta recibir una hora valida; sin espera bloqueante.");
-
   for (int i = 0; i < HOUR_POINTS; i++) {
     histTemp[i] = NAN;
     histHum[i]  = NAN;
@@ -1055,7 +1118,7 @@ void setup() {
     Serial.println("❌ Error montando SPIFFS.");
   }
 
-  server.begin();
+  // HTTP y NTP se inician desde loop() al obtener IPv4 y cerrar el portal.
 
   // La notificacion de inicio y la primera consulta se atienden desde loop().
 
@@ -1096,6 +1159,17 @@ void imprimirClimaExterior(Print &output) {
 }
 
 void loop() {
+  wifiProvisioning.process();
+  if (!serviciosRedIniciados && wifiProvisioning.ready()) {
+    // WiFiManager ya fue destruido: unico servidor en TCP 80.
+    server.begin();
+    serviciosRedIniciados = true;
+    Serial.print(F("[WM] HTTP listo; IPv4="));
+    Serial.println(WiFi.localIP());
+    DIAG_INICIO_NTP();
+    configTime(-3 * 3600, 0, "pool.ntp.org", "time.nist.gov");
+    Serial.println(F("[NTP] TLS pendiente hasta recibir una hora valida; sin espera bloqueante."));
+  }
   unsigned long ahora = millis();
   DIAG_OBSERVAR_NTP();
   DIAG_OBSERVAR_WIFI();
@@ -1106,6 +1180,7 @@ void loop() {
 // 2) Lectura DHT + alerta
   if (ahora - lastRead > READ_INTERVAL_MS) {
     lastRead = ahora;
+    PERF_DHT_ATTEMPT();
 
     if (leerDHT()) {
       float tUso = isnan(tempFiltrada) ? TEMPERATURA : tempFiltrada;
@@ -1139,16 +1214,22 @@ void loop() {
   // =============================
   // SERVIDOR WEB
   // =============================
+  // HTTP_CLIENTS_BEGIN
+  httpClients.expire(millis());
+  // HTTP_CLIENTS_END
+  if (!serviciosRedIniciados || wifiProvisioning.portalActive()) return;
   WiFiClient client = server.available();
   if (!client) {
     atenderServiciosExternos();
     return;
   }
+  PERF_HTTP_REQUEST();
   DIAG_CLIENTE_HTTP(millis());
 
   unsigned long timeout = millis();
   while (!client.available()) {
     if (millis() - timeout > 500) {
+      PERF_HTTP_PHASE(Cierre);
       client.stop();
       return;
     }
@@ -1157,6 +1238,7 @@ void loop() {
     delay(1);
   }
 
+  PERF_HTTP_PHASE(Recepcion);
   String requestLine = client.readStringUntil('\r');
   client.read(); // '\n'
 
@@ -1166,13 +1248,27 @@ void loop() {
     if (header.length() == 1) break;
   }
 
+  PERF_HTTP_PHASE(Preparacion);
+  // LED_CONTROL_BEGIN
+  if (ledApi.handleRequest(requestLine.c_str(), client)) {
+    PERF_HTTP_ROUTE(F("/led"));
+    PERF_HTTP_PHASE(Cierre);
+    client.stop();
+    return;
+  }
+  // LED_CONTROL_END
   // /data
-  if (requestLine.indexOf("GET /data") >= 0) {
+  if (HttpActiveClients::isDataRequest(requestLine.c_str())) {
+    PERF_HTTP_ROUTE(F("/data"));
+    // HTTP_CLIENTS_BEGIN
+    httpClients.record(static_cast<uint32_t>(client.remoteIP()), millis());
+    // HTTP_CLIENTS_END
     String fechaHora = obtenerFechaHora();
 
     float tOut = isnan(tempFiltrada) ? TEMPERATURA : tempFiltrada;
     float hOut = isnan(humFiltrada)  ? HUMEDAD     : humFiltrada;
 
+    PERF_HTTP_PHASE(Respuesta);
     client.println("HTTP/1.1 200 OK");
     client.println("Content-Type: application/json");
     client.println("Connection: close");
@@ -1202,7 +1298,9 @@ void loop() {
     client.print(faseNombre(f));
 
     String lunaNueva, lunaLlena;
+    PERF_HTTP_MOON_BEGIN();
     calcularLunas(lunaNueva, lunaLlena);
+    PERF_HTTP_MOON_END();
 
     client.print("\",\"nextNewMoon\":\"");
     client.print(lunaNueva);
@@ -1225,82 +1323,106 @@ void loop() {
     }
     client.print("]");
     imprimirClimaExterior(client);
+    // HTTP_CLIENTS_BEGIN
+    client.print(",\"clients\":");
+    httpClients.printState(client);
+    // HTTP_CLIENTS_END
+    // LED_CONTROL_BEGIN
+    client.print(",\"led\":");
+    ledApi.printState(client);
+    // LED_CONTROL_END
     client.println("}");
 
+    PERF_HTTP_PHASE(Cierre);
     client.stop();
     return;
   }
 
   // /csv
   if (requestLine.startsWith("GET /csv ")) {
-    if (!spiffsOk || !SPIFFS.exists(LOG_FILE)) {
+    PERF_HTTP_ROUTE(F("/csv"));
+    if (!spiffsOk || !csvReadable || SPIFFS.exists(LOG_BACKUP_FILE) || !SPIFFS.exists(LOG_FILE)) {
+      PERF_HTTP_PHASE(Respuesta);
       client.println("HTTP/1.1 500 Internal Server Error");
       client.println("Content-Type: text/plain");
       client.println("Connection: close");
       client.println();
       client.println("Log no disponible");
+      PERF_HTTP_PHASE(Cierre);
       client.stop();
       return;
     }
 
     File f = SPIFFS.open(LOG_FILE, "r");
-    if (!f) {
+    const bool legacyExists = SPIFFS.exists(LEGACY_LOG_FILE);
+    File legacy;
+    if (legacyExists) legacy = SPIFFS.open(LEGACY_LOG_FILE, "r");
+    const bool hasLegacy = legacy && legacy.size() > 0;
+    char header[WeatherCsv::ROW_SIZE];
+    bool complete;
+    bool ok = f && WeatherCsv::line(f, header, sizeof(header), complete) &&
+              strcmp(header, WeatherCsv::HEADER) == 0;
+    if (legacyExists && !legacy) ok = false;
+    if (hasLegacy) ok = legacy && WeatherCsv::line(legacy, header, sizeof(header), complete) &&
+                        WeatherCsv::legacyHeader(header) && ok;
+    if (!ok) {
+      f.close(); legacy.close();
+      PERF_HTTP_PHASE(Respuesta);
       client.println("HTTP/1.1 500 Internal Server Error");
       client.println("Content-Type: text/plain");
       client.println("Connection: close");
       client.println();
-      client.println("No se pudo abrir el log");
+      client.println("No se pudo abrir el historial CSV");
+      PERF_HTTP_PHASE(Cierre);
       client.stop();
       return;
     }
-
+    PERF_HTTP_PHASE(Respuesta);
     client.println("HTTP/1.1 200 OK");
-    client.println("Content-Type: text/csv");
+    client.println("Content-Type: text/csv; charset=utf-8");
     client.println("Content-Disposition: attachment; filename=\"" + obtenerNombreCSV() + "\"");
     client.println("Connection: close");
     client.println();
-
-    uint8_t buf[512];
-    while (f.available()) {
-      size_t len = f.read(buf, sizeof(buf));
-      client.write(buf, len);
-    }
-
-    f.close();
+    client.println(WeatherCsv::HEADER);
+    if (hasLegacy) ok = WeatherCsv::exportRows(legacy, client, true);
+    if (ok) ok = WeatherCsv::exportRows(f, client, false);
+    if (!ok) Serial.println("[CSV] descarga incompleta; verificar archivo o conexion.");
+    f.close(); legacy.close();
+    PERF_HTTP_PHASE(Cierre);
     client.stop();
     return;
   }
 
   // /clearcsv
   if (requestLine.startsWith("GET /clearcsv ")) {
-    if (spiffsOk && SPIFFS.exists(LOG_FILE)) {
-      SPIFFS.remove(LOG_FILE);
-    }
-
-    File nf = SPIFFS.open(LOG_FILE, "w");
-    if (nf) {
-      nf.println("FechaHora,Temperatura,Hum.edad");
-      nf.close();
-    }
-
-    logLines = 0;
-
-    Serial.println("🗑️ Historial CSV borrado manualmente.");
-
-    client.println("HTTP/1.1 200 OK");
+    PERF_HTTP_ROUTE(F("/clearcsv"));
+    bool reiniciado = spiffsOk;
+    if (reiniciado && SPIFFS.exists(LEGACY_LOG_FILE)) reiniciado = SPIFFS.remove(LEGACY_LOG_FILE);
+    if (reiniciado && SPIFFS.exists(LOG_FILE)) reiniciado = SPIFFS.remove(LOG_FILE);
+    if (reiniciado && SPIFFS.exists(LOG_BACKUP_FILE)) reiniciado = SPIFFS.remove(LOG_BACKUP_FILE);
+    if (reiniciado && SPIFFS.exists(LOG_TEMP_FILE)) reiniciado = SPIFFS.remove(LOG_TEMP_FILE);
+    if (reiniciado) reiniciado = crearCabeceraCSV(LOG_FILE);
+    if (spiffsOk) iniciarLog();
+    reiniciado = reiniciado && csvReady;
+    Serial.println(reiniciado ? "[CSV] historial borrado manualmente." : "[CSV] fallo al borrar historial.");
+    PERF_HTTP_PHASE(Respuesta);
+    client.println(reiniciado ? "HTTP/1.1 200 OK" : "HTTP/1.1 500 Internal Server Error");
     client.println("Content-Type: text/plain");
     client.println("Connection: close");
     client.println();
-    client.println("CSV borrado correctamente");
+    client.println(reiniciado ? "CSV borrado correctamente" : "No se pudo borrar el historial CSV");
+    PERF_HTTP_PHASE(Cierre);
     client.stop();
     return;
   }
 
   // /csvinfo
   if (requestLine.startsWith("GET /csvinfo ")) {
+    PERF_HTTP_ROUTE(F("/csvinfo"));
     String f1, f2;
     obtenerFechasCSV(f1, f2);
 
+    PERF_HTTP_PHASE(Respuesta);
     client.println("HTTP/1.1 200 OK");
     client.println("Content-Type: application/json");
     client.println("Connection: close");
@@ -1309,11 +1431,14 @@ void loop() {
     client.print("{\"first\":\"" + f1 + "\",");
     client.print("\"last\":\"" + f2 + "\"}");
 
+    PERF_HTTP_PHASE(Cierre);
     client.stop();
     return;
   }
 
   // Página principal (HTML simple de prueba)
+  PERF_HTTP_ROUTE(F("HTML"));
+  PERF_HTTP_PHASE(Respuesta);
   client.println("HTTP/1.1 200 OK");
   client.println("Content-Type: text/html");
   client.println("Connection: close");
@@ -1409,6 +1534,11 @@ void loop() {
             gap: 2px;
         }
 
+        /* HTTP_CLIENTS_BEGIN */
+        .http-clients { display: flex; align-items: center; gap: 5px; margin-top: 5px;
+            font-size: 11px; color: #AAA; }
+        .http-clients .material-symbols-rounded { font-size: 16px; }
+        /* HTTP_CLIENTS_END */
         .update-label {
             font-size: 9px;
             letter-spacing: 0.16em;
@@ -1641,7 +1771,6 @@ void loop() {
             margin: 0;
             padding: 22px;
             border: 1px solid rgba(255,255,255,0.06);
-            transition: transform 0.25s, box-shadow 0.25s;
         }
 
         .card-heading, .card-title-group {
@@ -1650,6 +1779,28 @@ void loop() {
             gap: 12px;
         }
 
+        /* LED_CONTROL_BEGIN */
+        .card-heading.local-heading { align-items: flex-start; flex-wrap: nowrap; gap: 8px; }
+        .led-control { margin-left: auto; text-align: right; font-size: 11px; color: #AAA; }
+        .led-switch { display: flex; align-items: center; gap: 6px; margin-left: auto;
+            background: none; border: 0; padding: 6px 0; min-height: 44px; color: #EEE; cursor: pointer; font: inherit; }
+        .led-track { width: 34px; height: 20px; border-radius: 12px; background: #555; padding: 3px; }
+        .led-track::after { content: ''; display: block; width: 14px; height: 14px;
+            background: #FFF; border-radius: 50%; }
+        .led-switch[aria-checked="true"] .led-track { background: #16A085; }
+        .led-switch[aria-checked="true"] .led-track::after { transform: translateX(14px); }
+        .led-switch:disabled { opacity: .55; cursor: wait; }
+        .led-auto { display: block; margin: 3px 0 0 auto; background: none; border: 0;
+            padding: 4px 0; color: #82CFC0; text-decoration: underline; font: inherit; cursor: pointer; }
+        .led-auto:disabled { color: #999; text-decoration: none; cursor: default; }
+        #ledError { display: block; max-width: 140px; color: #FFB4A9; }
+        @media (max-width: 400px) {
+            .local-heading .card-title-group { gap: 6px; }
+            .local-heading h2 { font-size: 16px; }
+            .local-heading .card-symbol { font-size: 24px; }
+            .led-control { max-width: 100px; flex-shrink: 0; }
+        }
+        /* LED_CONTROL_END */
         .card-heading { justify-content: space-between; margin-bottom: 25px; }
         .card-title-group { min-width: 0; }
         .card-symbol { color: #ff8b5d; font-size: 30px; }
@@ -1697,10 +1848,6 @@ void loop() {
         .lunar-event { display: flex; flex-direction: column; gap: 8px; padding-left: 22px; border-left: 1px solid rgba(255,255,255,0.08); }
         .lunar-event .label-ios { font-size: 12px; }
         .lunar-event .value-ios { font-size: 17px; font-weight: 600; }
-
-        @media (hover: hover) {
-            .environment-card:hover { transform: translateY(-2px); box-shadow: 0 8px 22px rgba(0,0,0,0.15); }
-        }
 
         @media (max-width: 680px) {
             body { padding: 18px 16px; }
@@ -1869,13 +2016,19 @@ void loop() {
         <div class="header-update">
             <span class="update-label">Actualización de pantalla</span>
             <span id="time" class="update-value">--/--/---- --:--:--</span>
+            <!-- HTTP_CLIENTS_BEGIN -->
+            <span class="http-clients" title="IPv4 distintas con GET /data en los últimos 30 s; + indica límite de registros">
+                <span class="material-symbols-rounded" aria-hidden="true">devices</span>
+                <span id="httpClients" role="status" aria-live="polite">Clientes activos: --</span>
+            </span>
+            <!-- HTTP_CLIENTS_END -->
         </div>
     </div>
 
     <main class="monitoring-layout">
     <section class="environment-grid" aria-label="Monitoreo ambiental">
         <article class="panel environment-card" aria-labelledby="localTitle">
-            <header class="card-heading">
+            <header class="card-heading local-heading">
                 <div class="card-title-group">
                     <span class="material-symbols-rounded card-symbol" aria-hidden="true">sensors</span>
                     <div>
@@ -1883,6 +2036,17 @@ void loop() {
                         <p class="card-subtitle">DHT22 · ESP8266</p>
                     </div>
                 </div>
+                <!-- LED_CONTROL_BEGIN -->
+                <div class="led-control">
+                    <button id="ledSwitch" class="led-switch" type="button" role="switch"
+                            aria-checked="false" aria-label="LEDs D6/D7" disabled>
+                        <span class="led-track" aria-hidden="true"></span><span>LEDs D6/D7</span>
+                    </button>
+                    <span id="ledStatus" role="status" aria-live="polite">Sin confirmar</span>
+                    <button id="ledAuto" class="led-auto" type="button" disabled>Automático</button>
+                    <span id="ledError" role="alert"></span>
+                </div>
+                <!-- LED_CONTROL_END -->
             </header>
             <div class="metric-grid">
                 <div>
@@ -1970,25 +2134,6 @@ void loop() {
         let tempHourChart, humHourChart;
 
         const HOUR_POINTS = 60;
-        let bufferTemp = [];
-        let bufferHum = [];
-
-        function smoothEWMA(values, alpha = 0.2) {
-            if (values.length < 2) {
-                return values[values.length - 1];
-            }
-
-            let prev = values[0];
-            let smoothed = prev;
-
-            for (let i = 1; i < values.length; i++) {
-                smoothed = alpha * values[i] + (1 - alpha) * prev;
-                prev = smoothed;
-            }
-
-            return smoothed;
-        }
-
         function crearGraficos() {
             const tctx = document.getElementById('tempChart').getContext('2d');
             const hctx = document.getElementById('humChart').getContext('2d');
@@ -2002,7 +2147,7 @@ void loop() {
                         data: [],
                         borderColor: 'rgba(255,99,132,1)',
                         backgroundColor: 'rgba(255,99,132,0.25)',
-                        tension: 0.4,
+                        tension: 0,
                         pointRadius: 0
                     }]
                 },
@@ -2023,6 +2168,7 @@ void loop() {
                                 lineWidth: 1
                             },
                             ticks: {
+                                stepSize: 0.5,
                                 callback: function (v) {
                                     return v.toFixed(1);
                                 }
@@ -2169,6 +2315,33 @@ void loop() {
             chart.update();
         }
 
+        function actualizarEscalaTemperatura() {
+            const valores = tempChart.data.datasets[0].data;
+            if (!valores.length) return;
+
+            const minimo = Math.min(...valores);
+            const maximo = Math.max(...valores);
+            const eje = tempChart.options.scales.y;
+
+            if (eje.min === undefined || eje.max === undefined) {
+                const centro = Math.round(((minimo + maximo) / 2) * 2) / 2;
+                eje.min = centro - 1.5;
+                eje.max = centro + 1.5;
+            }
+
+            if (minimo <= eje.min || maximo >= eje.max ||
+                (eje.max - eje.min > 3 && maximo - minimo <= 1)) {
+                if (maximo - minimo <= 1) {
+                    const centro = Math.round(((minimo + maximo) / 2) * 2) / 2;
+                    eje.min = centro - 1.5;
+                    eje.max = centro + 1.5;
+                } else {
+                    eje.min = Math.floor((minimo - 0.5) * 2) / 2;
+                    eje.max = Math.max(eje.min + 3, Math.ceil((maximo + 0.5) * 2) / 2);
+                }
+            }
+        }
+
         function actualizarClimaExterior(weather, offline = false) {
             const status = document.getElementById('weatherStatus');
             if (offline) {
@@ -2185,9 +2358,83 @@ void loop() {
             status.dataset.state = !valid ? 'empty' : (weather.stale ? 'stale' : 'current');
         }
 
+        // LED_CONTROL_BEGIN
+        let ledConfirmed = null;
+        let ledPending = false;
+        let ledGeneration = 0;
+
+        function mostrarLed(state) {
+            if (!state || !['auto', 'manual'].includes(state.mode) || typeof state.on !== 'boolean' ||
+                typeof state.d6 !== 'boolean' || typeof state.d7 !== 'boolean' ||
+                state.on !== (state.d6 && state.d7) ||
+                (state.mode === 'manual' && state.d6 !== state.d7)) {
+                throw new Error('Estado LED inválido');
+            }
+            ledConfirmed = state;
+            document.getElementById('ledSwitch').setAttribute('aria-checked', String(state.on));
+            document.getElementById('ledStatus').textContent =
+                state.mode === 'auto' ? 'Automático' : `Manual · ${state.on ? 'ON' : 'OFF'}`;
+            document.getElementById('ledSwitch').title =
+                `D6 ${state.d6 ? 'ON' : 'OFF'} · D7 ${state.d7 ? 'ON' : 'OFF'}`;
+            document.getElementById('ledSwitch').disabled = ledPending;
+            document.getElementById('ledAuto').disabled = ledPending || state.mode === 'auto';
+        }
+
+        function errorLed() {
+            document.getElementById('ledError').textContent = 'Sin confirmación. Reintentá.';
+            document.getElementById('ledSwitch').disabled = true;
+            document.getElementById('ledAuto').disabled = true;
+        }
+
+        async function cambiarLed(auto = false) {
+            if (ledPending || !ledConfirmed) return;
+            ledPending = true;
+            ++ledGeneration;
+            mostrarLed(ledConfirmed);
+            document.getElementById('ledError').textContent = '';
+            document.getElementById('ledStatus').textContent = 'Confirmando…';
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), 8000);
+            try {
+                const query = auto ? 'mode=auto' : `mode=manual&on=${ledConfirmed.on ? 0 : 1}`;
+                const response = await fetch(`/led?${query}`, {
+                    method: 'PUT', cache: 'no-store', signal: controller.signal
+                });
+                if (!response.ok) throw new Error('Error HTTP');
+                const state = await response.json();
+                // Validar antes de habilitar controles o sustituir el ultimo estado confirmado.
+                mostrarLed(state);
+                ledPending = false;
+                mostrarLed(state);
+            } catch (error) {
+                ledPending = false;
+                mostrarLed(ledConfirmed);
+                errorLed();
+            } finally {
+                clearTimeout(timeout);
+                ++ledGeneration; // Descarta consultas /data iniciadas durante el comando.
+            }
+        }
+        // LED_CONTROL_END
+
+        // HTTP_CLIENTS_BEGIN
+        function mostrarClientes(state) {
+            const valid = state && Number.isInteger(state.active) && state.active >= 0 &&
+                state.active <= 8 && typeof state.limited === 'boolean';
+            document.getElementById('httpClients').textContent = valid ?
+                `Clientes activos: ${state.active}${state.limited ? '+' : ''}` :
+                'Clientes activos: sin conexión';
+        }
+        // HTTP_CLIENTS_END
         function actualizarDatos() {
+            // LED_CONTROL_BEGIN
+            const ledVersion = ledGeneration;
+            // LED_CONTROL_END
             fetch('/data')
-                .then(r => r.json())
+                .then(r => {
+                    if (!r.ok) throw new Error('Error HTTP /data');
+                    return r.json();
+                })
                 .then(d => {
                     document.getElementById('temp').textContent = d.temp.toFixed(1);
                     document.getElementById('hum').textContent = d.hum.toFixed(0);
@@ -2197,34 +2444,30 @@ void loop() {
                     document.getElementById('hmax').textContent = d.hmax.toFixed(0);
                     document.getElementById('time').textContent = d.time;
                     actualizarClimaExterior(d.weather);
+                    // HTTP_CLIENTS_BEGIN
+                    mostrarClientes(d.clients);
+                    // HTTP_CLIENTS_END
+                    // LED_CONTROL_BEGIN
+                    if (!ledPending && ledVersion === ledGeneration) {
+                        try {
+                            mostrarLed(d.led);
+                            document.getElementById('ledError').textContent = '';
+                        } catch (error) { errorLed(); }
+                    }
+                    // LED_CONTROL_END
 
                     document.getElementById('moonIcon').textContent = d.moonIcon;
                     document.getElementById('moonName').textContent = d.moonName;
                     document.getElementById('nextNewMoon').textContent = d.nextNewMoon;
                     document.getElementById('nextFullMoon').textContent = d.nextFullMoon;
 
-                    bufferTemp.push(d.temp);
-                    bufferHum.push(d.hum);
+                    agregarPunto(tempChart, d.time, d.temp, 40);
+                    agregarPunto(humChart, d.time, d.hum, 40);
 
-                    if (bufferTemp.length > 50) {
-                        bufferTemp.shift();
-                    }
+                    actualizarEscalaTemperatura();
 
-                    if (bufferHum.length > 50) {
-                        bufferHum.shift();
-                    }
-
-                    const tempSmoothed = smoothEWMA(bufferTemp, 0.2);
-                    const humSmoothed = smoothEWMA(bufferHum, 0.2);
-
-                    agregarPunto(tempChart, d.time, tempSmoothed, 40);
-                    agregarPunto(humChart, d.time, humSmoothed, 40);
-
-                    tempChart.options.scales.y.min = tempSmoothed - 0.5;
-                    tempChart.options.scales.y.max = tempSmoothed + 0.5;
-
-                    humChart.options.scales.y.min = humSmoothed - 2;
-                    humChart.options.scales.y.max = humSmoothed + 2;
+                    humChart.options.scales.y.min = d.hum - 2;
+                    humChart.options.scales.y.max = d.hum + 2;
 
                     tempChart.update();
                     humChart.update();
@@ -2256,11 +2499,21 @@ void loop() {
                 })
                 .catch(err => {
                     console.error('Error al obtener /data', err);
+                    // HTTP_CLIENTS_BEGIN
+                    mostrarClientes(null);
+                    // HTTP_CLIENTS_END
                     actualizarClimaExterior(null, true);
+                    // LED_CONTROL_BEGIN
+                    if (!ledPending && ledVersion === ledGeneration) errorLed();
+                    // LED_CONTROL_END
                 });
         }
 
         window.addEventListener('load', () => {
+            // LED_CONTROL_BEGIN
+            document.getElementById('ledSwitch').addEventListener('click', () => cambiarLed());
+            document.getElementById('ledAuto').addEventListener('click', () => cambiarLed(true));
+            // LED_CONTROL_END
             crearGraficos();
             actualizarDatos();
             setInterval(actualizarDatos, 2000);
@@ -2320,7 +2573,10 @@ void loop() {
         document.getElementById('btnClear').addEventListener('click', function () {
             if (confirm('¿Seguro que deseas borrar TODO el historial del CSV?')) {
                 fetch('/clearcsv')
-                    .then(() => alert('Historial CSV borrado correctamente.'))
+                    .then(r => {
+                        if (!r.ok) throw new Error('Error al borrar CSV');
+                        alert('Historial CSV borrado correctamente.');
+                    })
                     .catch(() => alert('Error al borrar el CSV.'));
             }
         });
@@ -2335,5 +2591,6 @@ void loop() {
 
 )rawliteral"));
 
+  PERF_HTTP_PHASE(Cierre);
   client.stop();
 }
