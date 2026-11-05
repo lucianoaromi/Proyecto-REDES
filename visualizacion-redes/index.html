@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="description" content="Explorador didáctico local de la arquitectura de Proyecto-REDES: ESP8266, HTTP, Wi-Fi, sensores y servicios externos.">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self' file:; script-src 'self' file:; style-src 'self' file:; img-src 'self' file: data:; connect-src 'none'; object-src 'none'; base-uri 'none'">
+  <title>Proyecto-REDES · Arquitectura en movimiento</title>
+  <link rel="stylesheet" href="styles.css">
+  <script src="script.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#workspace">Ir a la visualización</a>
+  <header class="site-header">
+    <a class="brand" href="index.html" aria-label="Proyecto-REDES, inicio"><span class="brand-mark" aria-hidden="true">R<span>·</span></span><span>PROYECTO<span class="brand-light">—REDES</span><small>MONITOREO AMBIENTAL / ESP8266</small></span></a>
+    <div class="header-actions"><span class="local-badge"><i></i> DEMOSTRACIÓN LOCAL</span><button class="quiet-button" id="fullscreen" type="button">⛶ <span>Pantalla completa</span></button></div>
+  </header>
+
+  <main>
+    <section class="intro" aria-labelledby="page-title"><div><p class="eyebrow">LABORATORIO INTERACTIVO <span>/</span> REDES DE DATOS</p><h1 id="page-title">La información <em>en movimiento.</em></h1><p class="intro-copy">Del navegador al GPIO. Explorá cómo se conecta, recibe y responde nuestra estación ambiental.</p></div><div class="intro-note"><span class="outline-dot"></span><p>Representación didáctica<br><strong>Sin tráfico ni dispositivos reales</strong></p></div></section>
+
+    <div class="app-layout" id="workspace">
+      <aside class="scenario-panel" aria-label="Escenarios y reproducción">
+        <div class="panel-label"><span>01 / EXPLORAR</span><span class="tiny-label">8 RECORRIDOS</span></div>
+        <h2>Elegí un escenario</h2>
+        <div class="scenario-list" id="scenarios" role="group" aria-label="Seleccionar comunicación">
+          <button type="button" data-scenario="http" class="scenario active" aria-pressed="true"><span class="scenario-number">01</span><span><strong>Acceso al servidor</strong><small>Navegador → ESP8266</small></span><span class="scenario-arrow">↗</span></button>
+          <button type="button" data-scenario="led" class="scenario" aria-pressed="false"><span class="scenario-number">02</span><span><strong>Control de LEDs</strong><small>Una orden, dos salidas</small></span><span class="scenario-arrow">↗</span></button>
+          <button type="button" data-scenario="weather" class="scenario" aria-pressed="false"><span class="scenario-number">03</span><span><strong>Consulta WeatherAPI</strong><small>Clima exterior por HTTPS</small></span><span class="scenario-arrow">↗</span></button>
+          <button type="button" data-scenario="telegram" class="scenario" aria-pressed="false"><span class="scenario-number">04</span><span><strong>Aviso a Telegram</strong><small>Notificación saliente</small></span><span class="scenario-arrow">↗</span></button>
+          <button type="button" data-scenario="wifi" class="scenario" aria-pressed="false"><span class="scenario-number">05</span><span><strong>Conexión Wi-Fi</strong><small>Asociación, DHCP y servicios</small></span><span class="scenario-arrow">↗</span></button>
+          <button type="button" data-scenario="portal" class="scenario" aria-pressed="false"><span class="scenario-number">06</span><span><strong>Portal WiFiManager</strong><small>Configuración inicial separada</small></span><span class="scenario-arrow">↗</span></button>
+          <button type="button" data-scenario="ntp" class="scenario" aria-pressed="false"><span class="scenario-number">07</span><span><strong>Sincronización NTP</strong><small>Hora válida antes de TLS</small></span><span class="scenario-arrow">↗</span></button>
+          <button type="button" data-scenario="general" class="scenario" aria-pressed="false"><span class="scenario-number">08</span><span><strong>Recorrido general</strong><small>De la red al hardware</small></span><span class="scenario-arrow">↗</span></button>
+        </div>
+        <div class="scenario-options">
+          <label for="client">Cliente local</label><select id="client"><option value="pc">Computadora</option><option value="phone">Teléfono móvil</option></select>
+          <fieldset id="led-options" hidden><legend>Orden conjunta D6 + D7</legend><div class="segmented"><button type="button" data-led="on" class="selected" aria-pressed="true">Encender</button><button type="button" data-led="off" aria-pressed="false">Apagar</button><button type="button" data-led="auto" aria-pressed="false">Auto</button></div><p>En automático cada LED depende del último clima válido.</p></fieldset>
+        </div>
+        <div class="playback"><button id="play" class="primary-button" type="button"><span id="play-symbol" aria-hidden="true">▶</span><span id="play-label">Iniciar recorrido</span></button><div class="secondary-controls"><button id="next" type="button">Paso siguiente →</button><button id="reset" type="button">↺ Reiniciar</button></div><label class="speed-label" for="speed">Velocidad <output id="speed-value" for="speed">1×</output></label><input id="speed" type="range" min="0.5" max="2" value="1" step="0.5"></div>
+        <p class="keyboard-hint"><kbd>Espacio</kbd> reproducir / pausar <br><kbd>→</kbd> paso <kbd>R</kbd> reiniciar</p>
+      </aside>
+
+      <section class="diagram-panel" aria-labelledby="diagram-heading">
+        <div class="diagram-header"><div><p class="panel-label">02 / ARQUITECTURA</p><h2 id="diagram-heading">Una estación. Múltiples conversaciones.</h2></div><div class="view-tabs" role="tablist" aria-label="Vista del diagrama"><button role="tab" id="tab-network" aria-controls="view-network" aria-selected="true" tabindex="0" type="button">Red</button><button role="tab" id="tab-hardware" aria-controls="view-hardware" aria-selected="false" tabindex="-1" type="button">Hardware</button></div></div>
+        <div class="diagram-canvas">
+          <div id="view-network" role="tabpanel" aria-labelledby="tab-network" tabindex="0">
+            <svg id="network-svg" class="topology" viewBox="0 0 1100 570" role="group" aria-labelledby="network-title network-desc">
+              <title id="network-title">Topología funcional de la estación ambiental</title><desc id="network-desc">Computadora y teléfono se comunican con el ESP8266 por un punto de acceso de la misma red local. El ESP8266 inicia conexiones salientes hacia WeatherAPI, Telegram y NTP a través del gateway. El portal de configuración usa una conexión directa temporal al ESP8266. Seleccioná un dispositivo para conocer su función.</desc>
+              <defs>
+                <pattern id="grid" width="26" height="26" patternUnits="userSpaceOnUse"><circle cx="1" cy="1" r="0.9" fill="#283347"/></pattern>
+                <symbol id="icon-pc" viewBox="0 0 48 48"><rect x="5" y="7" width="38" height="27" rx="3"/><path d="M16 42h16M24 34v8M11 28h26"/></symbol>
+                <symbol id="icon-phone" viewBox="0 0 48 48"><rect x="12" y="3" width="24" height="42" rx="5"/><path d="M20 9h8M22 39h4"/></symbol>
+                <symbol id="icon-router" viewBox="0 0 48 48"><rect x="5" y="26" width="38" height="14" rx="4"/><path d="M12 26V14M36 26V14M18 17q6-6 12 0M13 11q11-10 22 0M12 33h1M19 33h1M33 33h3"/></symbol>
+                <symbol id="icon-chip" viewBox="0 0 48 48"><rect x="10" y="10" width="28" height="28" rx="4"/><rect x="17" y="17" width="14" height="14" rx="2"/><path d="M17 4v6M24 4v6M31 4v6M17 38v6M24 38v6M31 38v6M4 17h6M4 24h6M4 31h6M38 17h6M38 24h6M38 31h6"/></symbol>
+                <symbol id="icon-cloud" viewBox="0 0 48 48"><path d="M12 36a9 9 0 0 1-1-18 13 13 0 0 1 25-3 11 11 0 0 1 0 21Z"/><path d="M17 26h14m-7-7v14"/></symbol>
+                <symbol id="icon-weather" viewBox="0 0 48 48"><path d="M20 8V4M8 20H4M10 10l3 3M30 10l3-3"/><circle cx="20" cy="20" r="9"/><path d="M18 38a7 7 0 0 1 0-14 10 10 0 0 1 18 1 7 7 0 0 1 0 14Z"/></symbol>
+                <symbol id="icon-telegram" viewBox="0 0 48 48"><path d="m5 23 37-16-7 34-12-10-7 6 2-13 17-10-13 15Z"/></symbol>
+                <symbol id="icon-clock" viewBox="0 0 48 48"><circle cx="24" cy="24" r="19"/><path d="M24 12v13l9 5"/></symbol>
+              </defs>
+              <rect class="grid-fill" x="0" y="0" width="1100" height="570" fill="url(#grid)"/>
+              <path class="zone-divider" d="M800 55V510"/>
+              <text class="zone-label" x="42" y="38">RED LOCAL / MISMA SUBRED</text><text class="zone-label" x="837" y="38">SERVICIOS EXTERNOS</text>
+              <g id="network-links" fill="none">
+                <path id="link-pc-ap" class="link wifi" d="M213 180C265 180 277 283 310 283"/>
+                <path id="link-phone-ap" class="link wifi" d="M200 410C263 410 263 309 310 309"/>
+                <path id="link-ap-esp" class="link wifi" d="M470 305C518 305 518 395 565 395"/>
+                <path id="link-ap-net" class="link wan" d="M390 235V145Q390 110 425 110H580"/>
+                <path id="link-net-weather" class="link wan" d="M750 110H850"/>
+                <path id="link-net-telegram" class="link wan" d="M750 110H774Q804 110 804 140V230Q804 250 830 250H850"/>
+                <path id="link-net-ntp" class="link wan" d="M750 110H774Q804 110 804 140V380Q804 400 830 400H850"/>
+                <path id="link-pc-esp" class="link portal-link" d="M130 238V480Q130 510 160 510H650V453"/>
+                <path id="link-phone-esp" class="link portal-link" d="M200 410H295Q320 410 320 480Q320 510 350 510H650V453"/>
+              </g>
+              <g class="link-label"><text x="239" y="218">Wi-Fi</text><text x="473" y="356">Wi-Fi · 2,4 GHz</text><text x="403" y="189">Salida por gateway</text><text id="portal-label" x="340" y="534" hidden>AP TEMPORAL · CONEXIÓN DIRECTA</text></g>
+              <g class="device client-device" data-node="pc" role="button" tabindex="0" aria-label="Computadora cliente, ver detalles"><rect class="node-card" x="47" y="119" width="166" height="120" rx="16"/><use class="device-icon" href="#icon-pc" x="107" y="136" width="46" height="46"/><text class="node-name" x="130" y="205">Computadora</text><text class="node-sub" x="130" y="224">Navegador web</text></g>
+              <g class="device client-device" data-node="phone" role="button" tabindex="0" aria-label="Teléfono móvil cliente, ver detalles"><rect class="node-card" x="60" y="350" width="140" height="120" rx="16"/><use class="device-icon" href="#icon-phone" x="109" y="364" width="42" height="42"/><text class="node-name" x="130" y="437">Teléfono móvil</text><text class="node-sub" x="130" y="456">Navegador web</text></g>
+              <g class="device" data-node="ap" role="button" tabindex="0" aria-label="Router o punto de acceso, ver detalles"><rect class="node-card" x="310" y="235" width="160" height="123" rx="16"/><use class="device-icon" href="#icon-router" x="366" y="249" width="48" height="48"/><text class="node-name" x="390" y="322">Router / AP</text><text class="node-sub" x="390" y="343" id="ap-role">Puente en la LAN</text></g>
+              <g class="device esp-device" data-node="esp" role="button" tabindex="0" aria-label="ESP8266 NodeMCU, ver detalles"><rect class="node-card" x="565" y="333" width="180" height="121" rx="16"/><use class="device-icon" href="#icon-chip" x="631" y="345" width="48" height="48"/><circle class="status-dot" cx="720" cy="352" r="4"/><text class="node-name" x="655" y="418">ESP8266</text><text class="node-sub" x="655" y="439" id="esp-service">Servidor HTTP · TCP 80</text></g>
+              <g class="device" data-node="internet" role="button" tabindex="0" aria-label="Internet, ver detalles"><rect class="node-card" x="580" y="62" width="170" height="96" rx="16"/><use class="device-icon" href="#icon-cloud" x="594" y="84" width="46" height="46"/><text class="node-name start" x="649" y="105">Internet</text><text class="node-sub start" x="649" y="126">Tránsito lógico</text></g>
+              <g class="device external-device" data-node="weather" role="button" tabindex="0" aria-label="WeatherAPI, ver detalles"><rect class="node-card" x="850" y="62" width="214" height="96" rx="16"/><use class="device-icon" href="#icon-weather" x="864" y="85" width="42" height="42"/><text class="node-name start" x="919" y="102">WeatherAPI</text><text class="node-sub start" x="919" y="125">HTTPS · TCP 443</text></g>
+              <g class="device external-device" data-node="telegram" role="button" tabindex="0" aria-label="Telegram Bot API, ver detalles"><rect class="node-card" x="850" y="202" width="214" height="96" rx="16"/><use class="device-icon" href="#icon-telegram" x="864" y="226" width="42" height="42"/><text class="node-name start" x="919" y="242">Telegram</text><text class="node-sub start" x="919" y="265">HTTPS · TCP 443</text></g>
+              <g class="device external-device" data-node="ntp" role="button" tabindex="0" aria-label="Servidores de hora NTP, ver detalles"><rect class="node-card" x="850" y="352" width="214" height="96" rx="16"/><use class="device-icon" href="#icon-clock" x="864" y="376" width="42" height="42"/><text class="node-name start" x="919" y="392">Hora NTP</text><text class="node-sub start" x="919" y="415">SNTP · UDP 123</text></g>
+              <g id="network-packets" class="packets" aria-hidden="true"></g>
+              <text class="diagram-footnote" x="42" y="560">Topología conceptual: enlaces y tiempos sin escala. Seleccioná un dispositivo para inspeccionarlo.</text>
+            </svg>
+          </div>
+          <div id="view-hardware" role="tabpanel" aria-labelledby="tab-hardware" tabindex="0" hidden>
+            <svg id="hardware-svg" class="topology" viewBox="0 0 1100 570" role="group" aria-labelledby="hardware-title hardware-desc">
+              <title id="hardware-title">Mapa funcional de GPIO del ESP8266</title><desc id="hardware-desc">El DHT22 intercambia datos por D5. D6 controla el LED de temperatura exterior y D7 el de lluvia. El control manual actúa sobre ambos. La alimentación, las resistencias de los LEDs y el trazado completo no están especificados: este gráfico no es un plano de montaje.</desc>
+              <rect x="0" y="0" width="1100" height="570" fill="url(#grid)"/>
+              <text class="zone-label" x="42" y="38">HARDWARE / CONEXIONES FUNCIONALES VERIFICADAS</text>
+              <path id="link-dht" class="link physical" d="M310 220H420"/><path id="link-d6" class="link physical" d="M660 230H820"/><path id="link-d7" class="link physical" d="M660 350H820"/>
+              <g class="device" data-node="dht" role="button" tabindex="0" aria-label="Sensor DHT22, ver detalles"><rect class="node-card" x="90" y="148" width="220" height="166" rx="18"/><rect class="sensor-body" x="169" y="166" width="62" height="67" rx="8"/><path class="sensor-slots" d="M181 178v42M194 178v42M207 178v42M220 178v42"/><text class="node-name" x="200" y="262">DHT22</text><text class="node-sub" x="200" y="286">Temperatura + humedad local</text></g>
+              <g class="device board-device" data-node="esp" role="button" tabindex="0" aria-label="NodeMCU y pines, ver detalles"><rect class="board" x="420" y="105" width="240" height="343" rx="18"/><circle class="screw" cx="437" cy="123" r="5"/><circle class="screw" cx="643" cy="123" r="5"/><circle class="screw" cx="437" cy="430" r="5"/><circle class="screw" cx="643" cy="430" r="5"/><path class="antenna" d="M468 156v-24h18v24h18v-24h18v24h18v-24h18v24h18"/><rect class="chip" x="477" y="181" width="126" height="108" rx="6"/><text class="chip-name" x="540" y="227">ESP8266</text><text class="node-sub" x="540" y="254">NodeMCU</text><rect class="usb-port" x="512" y="414" width="56" height="34" rx="3"/><text class="pin-label" x="438" y="216">D5</text><text class="pin-label end" x="641" y="225">D6</text><text class="pin-label end" x="641" y="345">D7</text><circle class="pin" cx="421" cy="220" r="5"/><circle class="pin" cx="659" cy="230" r="5"/><circle class="pin" cx="659" cy="350" r="5"/><text class="node-sub" x="540" y="329">Servidor HTTP</text><text class="node-sub" x="540" y="353">↓</text><text class="node-sub" x="540" y="379">Control de salidas</text></g>
+              <g class="device led-device" data-node="d6" data-led-node="d6" role="button" tabindex="0" aria-label="LED D6, apagado, ver detalles"><rect class="node-card" x="820" y="157" width="208" height="134" rx="18"/><circle class="led-halo" cx="866" cy="204" r="22"/><path class="led-bulb" d="M853 218v-18a13 13 0 0 1 26 0v18ZM849 219h34M859 220v12M873 220v12"/><text class="node-name start" x="900" y="202">LED D6</text><text class="node-sub start led-text" x="900" y="225">APAGADO</text><text class="node-sub" x="924" y="268">digitalWrite · HIGH / LOW</text></g>
+              <g class="device led-device" data-node="d7" data-led-node="d7" role="button" tabindex="0" aria-label="LED D7, apagado, ver detalles"><rect class="node-card" x="820" y="314" width="208" height="134" rx="18"/><circle class="led-halo" cx="866" cy="361" r="22"/><path class="led-bulb" d="M853 375v-18a13 13 0 0 1 26 0v18ZM849 376h34M859 377v12M873 377v12"/><text class="node-name start" x="900" y="359">LED D7</text><text class="node-sub start led-text" x="900" y="382">APAGADO</text><text class="node-sub" x="924" y="425">PWM manual · 64 / 255</text></g>
+              <text class="wire-label" x="345" y="200">DATO</text><text class="wire-label" x="714" y="210">GPIO12</text><text class="wire-label" x="714" y="330">GPIO13</text><text class="wire-label" x="327" y="246">GPIO14</text>
+              <rect class="power-note" x="70" y="364" width="275" height="84" rx="12"/><text class="node-name start" x="88" y="392">Alimentación / masa</text><text class="node-sub start" x="88" y="415">VCC y GND: trazado no verificado.</text><text class="node-sub start" x="88" y="434">No se dibuja un circuito supuesto.</text>
+              <text class="diagram-footnote" x="70" y="500">DHT: interfaz digital propia, no IP. Lectura nominal cada 2,5 s; HTTPS puede demorar el loop.</text><text class="diagram-footnote" x="70" y="527">Mapa funcional, no plano de montaje. Resistencias y alimentación de LEDs no especificadas.</text>
+              <g id="hardware-packets" class="packets" aria-hidden="true"></g>
+            </svg>
+          </div>
+          <div class="diagram-status"><span id="stage-kind" class="evidence verified">VERIFICADO EN CÓDIGO</span><span id="network-mode">LAN · puente / capa de enlace</span><span class="led-readout" id="led-readout">D6 <i></i> D7 <i></i><span id="led-mode">AUTO · SIN CLIMA</span></span></div>
+        </div>
+        <div class="diagram-legend"><span><i class="legend-line wifi"></i>Enlace Wi-Fi</span><span><i class="legend-line physical"></i>Señal física GPIO</span><span><i class="legend-line wan"></i>Recorrido por Internet</span><span><i class="request-dot"></i>Solicitud / envío</span><span><i class="response-dot"></i>Respuesta</span></div>
+        <div class="step-explanation" aria-live="polite" aria-atomic="true"><span class="step-counter" id="step-counter">00</span><div><p class="eyebrow" id="step-label">LISTO PARA EXPLORAR</p><h3 id="step-title">El ESP8266 también es un servidor.</h3><p id="step-description">Iniciá el recorrido para seguir una solicitud y su respuesta en la red local.</p></div><span class="play-state" id="play-state">EN ESPERA</span></div>
+        <div class="timeline-wrap"><div class="timeline" id="timeline" aria-label="Etapas del escenario"></div><div class="timeline-caption"><span id="progress-label">0 de 0 etapas</span><span>Tiempos didácticos · no medidos</span></div></div>
+      </section>
+
+      <section class="technical-panel" aria-labelledby="technical-title"><div class="technical-heading"><p class="panel-label">03 / BAJO LA SUPERFICIE</p><h2 id="technical-title">Ficha de comunicación</h2></div><dl id="technical-fields"><div><dt>Emisor</dt><dd id="info-from">—</dd></div><div><dt>Receptor</dt><dd id="info-to">—</dd></div><div><dt>Protocolo</dt><dd id="info-protocol">HTTP sobre TCP/IP</dd></div><div><dt>Capa TCP/IP</dt><dd id="info-layer">Aplicación</dd></div><div><dt>Puerto destino</dt><dd id="info-port">TCP 80</dd></div><div><dt>Operación</dt><dd id="info-operation">GET /</dd></div></dl><div class="message-preview"><span id="message-label">MENSAJE REPRESENTADO</span><pre id="message">GET / HTTP/1.1</pre></div><p class="stage-note" id="stage-note">Los puertos de origen son efímeros. No se asignan valores inventados.</p></section>
+    </div>
+
+    <section class="context-strip" aria-label="Información del dispositivo seleccionado"><div><span class="panel-label">INSPECTOR DE DISPOSITIVOS</span><h3 id="node-title">ESP8266 NodeMCU</h3></div><p id="node-description">Atiende HTTP en TCP 80 y actúa como cliente de servicios externos. Los datos locales provienen del DHT22; el clima exterior proviene de WeatherAPI.</p><code id="node-source">ESP8266_DHT22.ino · WiFiServer server(80)</code></section>
+    <details class="technical-notes"><summary>Precisiones técnicas y alcance de la representación <span>+</span></summary><div class="notes-grid"><article><h3>La LAN no pasa por Internet</h3><p>Se supone que clientes y ESP8266 están en la misma subred y asociados al AP mostrado. El AP puentea las tramas locales. Solo las conexiones externas usan gateway; NAT depende del despliegue y no está demostrado por el sketch.</p></article><article><h3>DNS, TCP y TLS se simplifican</h3><p>Los nombres se resuelven si no están en caché. El DNS entregado por la red no está identificado y puede estar fuera de la LAN. Las negociaciones se agrupan por fases; no se muestran segmentos, retransmisiones ni tamaños reales.</p></article><article><h3>Portal ≠ servidor habitual</h3><p>WiFiManager abre un AP de configuración con HTTP y DNS cautivo. Tras conectar, lo cierra y destruye antes de iniciar el servidor habitual. La única IP mostrada es 192.168.4.1, documentada para ese portal.</p></article><article><h3>Fuentes y límites</h3><p>Basado en la rama experiment/wifimanager: sketch, wifi_provisioning.h, led_api_control.h, LED_CONTROL.md y WIFIMANAGER_EXPERIMENT.md. El esquema Conexiones.jpg no especifica el circuito de los LEDs.</p></article><article><h3>El navegador original también usa CDN</h3><p>La interfaz del firmware referencia Chart.js y Google Fonts por HTTPS. Este explorador representa el intercambio con el ESP; no anima esas descargas adicionales del navegador. Aquí todos los recursos son locales.</p></article><article><h3>Sin medición ni conexión al equipo</h3><p>Paquetes, duraciones y valores de ejemplo son didácticos. El estado de LEDs representa salidas ordenadas, no una medición eléctrica. Esta página no realiza solicitudes al ESP8266 ni a servicios externos.</p></article></div></details>
+  </main>
+  <footer><span>PROYECTO—REDES <span class="footer-divider">/</span> Arquitectura en movimiento</span><span>HTML · CSS · JavaScript · SVG <span class="footer-divider">/</span> Sin dependencias</span></footer>
+  <noscript><p class="noscript">Activá JavaScript para reproducir los recorridos. Los diagramas siguen disponibles.</p></noscript>
+</body>
+</html>
